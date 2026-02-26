@@ -1,0 +1,26 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtualenvs and env files
+venv/
+.venv/
+.env
+.env.*
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# IDEs
+.vscode/
+.idea/
+
+# Logs and misc
+*.log
+.DS_Store
+
+# Socket created by PhoneBridge
+/tmp/phonebridge-*.sock
