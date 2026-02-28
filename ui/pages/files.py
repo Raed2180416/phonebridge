@@ -11,9 +11,8 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap
 from ui.theme import (card_frame, lbl, section_label, action_btn, input_field,
-                      divider, TEAL, CYAN, VIOLET, ROSE, AMBER, BLUE,
+                      divider, with_alpha, TEAL, CYAN, VIOLET, ROSE, AMBER, BLUE,
                       TEXT, TEXT_DIM, TEXT_MID, BORDER)
-from ui.motion import breathe
 from backend.kdeconnect import KDEConnect
 from backend.syncthing import Syncthing
 import backend.settings_store as settings
@@ -23,6 +22,8 @@ log = logging.getLogger(__name__)
 SYNC_ROOT = os.path.expanduser("~/PhoneSync")
 
 DEFAULT_FOLDERS = [
+    {"icon":"📲","name":"KDE Connect Inbox", "id":"kdeconnect-inbox",
+     "path":"~/Downloads",                 "synced":False, "color":"#6ea8ff"},
     {"icon":"📸","name":"Camera Roll",    "id":"phone-camera",
      "path":f"{SYNC_ROOT}/Camera",       "synced":True,  "color":TEAL},
     {"icon":"📄","name":"Documents",      "id":"phone-docs",
@@ -57,9 +58,12 @@ class FilesPage(QWidget):
         overrides = settings.get("folder_overrides", {}) or {}
         custom = settings.get("custom_folders", []) or []
         folders = []
+        kde_receive_path = self.kc.get_receive_path()
         for folder in DEFAULT_FOLDERS:
             merged = dict(folder)
             fid = merged.get("id")
+            if fid == "kdeconnect-inbox":
+                merged["path"] = kde_receive_path
             if fid in overrides and overrides[fid]:
                 merged["path"] = overrides[fid]
             folders.append(merged)
@@ -175,7 +179,7 @@ class FilesPage(QWidget):
             }}
             QFrame:hover {{
                 background: rgba(255,255,255,0.06);
-                border-color: {color}44;
+                border-color: {with_alpha(color, 0.28)};
             }}
         """)
         f.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -192,7 +196,8 @@ class FilesPage(QWidget):
         status_row = QHBoxLayout()
         pip = QFrame()
         pip.setFixedSize(7,7)
-        synced = folder.get("synced", False)
+        synced = self._is_synced_in_syncthing(folder)
+        folder["synced"] = synced
         pip_color = TEAL if synced else AMBER
         pip.setStyleSheet(f"""
             QFrame {{
@@ -201,8 +206,6 @@ class FilesPage(QWidget):
                 border:none;
             }}
         """)
-        if synced:
-            breathe(pip, min_opacity=0.35, max_opacity=1.0)
         status_row.addWidget(pip)
         status_row.addWidget(lbl("Synced" if synced else "Paused", 10,
                                   pip_color if synced else AMBER))
@@ -275,10 +278,10 @@ class FilesPage(QWidget):
         set_btn.setFixedWidth(50)
         set_btn.setStyleSheet(f"""
             QPushButton {{
-                background:rgba(62,240,176,0.08);border:1px solid rgba(62,240,176,0.2);
+                background:rgba(167,139,250,0.08);border:1px solid rgba(167,139,250,0.2);
                 border-radius:8px;color:{TEAL};padding:7px;font-size:11px;
             }}
-            QPushButton:hover {{ background:rgba(62,240,176,0.18); }}
+            QPushButton:hover {{ background:rgba(167,139,250,0.18); }}
         """)
         set_btn.clicked.connect(lambda: self._set_folder_path(folder, path_input.text().strip()))
         path_row.addWidget(path_input)
@@ -355,7 +358,7 @@ class FilesPage(QWidget):
                 background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);
                 border-radius:7px;color:{TEXT_DIM};padding:5px 10px;font-size:11px;
             }}
-            QPushButton:hover {{ background:rgba(62,240,176,0.1);color:{TEAL};border-color:rgba(62,240,176,0.25); }}
+            QPushButton:hover {{ background:rgba(167,139,250,0.1);color:{TEAL};border-color:rgba(167,139,250,0.25); }}
         """)
         fp = full_path
         open_btn.clicked.connect(lambda _, p=fp: self._open_path(p))
@@ -364,10 +367,10 @@ class FilesPage(QWidget):
         send_btn = QPushButton("Send →")
         send_btn.setStyleSheet(f"""
             QPushButton {{
-                background:rgba(62,240,176,0.07);border:1px solid rgba(62,240,176,0.2);
+                background:rgba(167,139,250,0.07);border:1px solid rgba(167,139,250,0.2);
                 border-radius:7px;color:{TEAL};padding:5px 10px;font-size:11px;
             }}
-            QPushButton:hover {{ background:rgba(62,240,176,0.18); }}
+            QPushButton:hover {{ background:rgba(167,139,250,0.18); }}
         """)
         fp2 = full_path
         send_btn.clicked.connect(lambda _, p=fp2: self.kc.share_file(p))
@@ -486,17 +489,24 @@ class FilesPage(QWidget):
 
     def _is_synced_in_syncthing(self, folder):
         fid = self._folder_syncthing_id(folder)
-        if not fid:
-            return False
-        return self.st.get_folder(fid) is not None
+        path = os.path.normpath(str(folder.get("path", "") or ""))
+        if fid and self.st.get_folder(fid) is not None:
+            return True
+        for row in self.st.get_folders() or []:
+            candidate = os.path.normpath(str(row.get("path", "") or ""))
+            if path and candidate and path == candidate:
+                return True
+        return False
 
     def _refresh_sync_btn(self, folder, button):
         synced = self._is_synced_in_syncthing(folder)
         folder["synced"] = synced
         if synced:
-            button.setText("Unsync Folder")
+            button.setText("Synced")
+            button.setEnabled(False)
         else:
             button.setText("Sync Folder")
+            button.setEnabled(True)
         self._save_folders()
 
     def _toggle_syncthing_sync(self, folder, button):
@@ -507,12 +517,7 @@ class FilesPage(QWidget):
         if not fid:
             return
         if self._is_synced_in_syncthing(folder):
-            ok = self.st.remove_folder(fid)
-            if ok:
-                folder["synced"] = False
-                self._refresh_sync_btn(folder, button)
-            else:
-                QMessageBox.warning(self, "Syncthing", "Failed to remove folder from Syncthing.")
+            self._refresh_sync_btn(folder, button)
             return
         ok, created = self.st.add_folder(
             path=folder.get("path", ""),
@@ -528,19 +533,6 @@ class FilesPage(QWidget):
             QMessageBox.warning(self, "Syncthing", "Failed to add folder to Syncthing.")
 
     def _pick_text(self, title, prompt, default_text):
-        if shutil.which("kdialog"):
-            try:
-                r = subprocess.run(
-                    ["kdialog", "--inputbox", prompt, default_text, "--title", title],
-                    capture_output=True, text=True, timeout=30,
-                )
-                text = (r.stdout or "").strip()
-                if r.returncode == 0 and text:
-                    return text
-                if r.returncode != 0:
-                    return ""
-            except Exception:
-                pass
         text, ok = QInputDialog.getText(self, title, prompt, text=default_text)
         text = (text or "").strip()
         if ok and text:
@@ -595,33 +587,21 @@ class FilesPage(QWidget):
             log.warning("Delete folder failed %s: %s", path, e)
 
     def _pick_existing_dir(self, title, start_dir):
-        if shutil.which("kdialog"):
-            try:
-                r = subprocess.run(
-                    ["kdialog", "--getexistingdirectory", start_dir, "--title", title],
-                    capture_output=True, text=True, timeout=30,
-                )
-                path = (r.stdout or "").strip()
-                if r.returncode == 0 and path:
-                    return path
-            except Exception:
-                pass
         return QFileDialog.getExistingDirectory(self, title, start_dir)
 
     def _pick_files(self, title, start_dir):
-        if shutil.which("kdialog"):
-            try:
-                r = subprocess.run(
-                    ["kdialog", "--getopenfilename", start_dir, "*", "--multiple", "--separate-output", "--title", title],
-                    capture_output=True, text=True, timeout=60,
-                )
-                files = [line.strip() for line in (r.stdout or "").splitlines() if line.strip()]
-                if r.returncode == 0 and files:
-                    return files
-            except Exception:
-                pass
         files, _ = QFileDialog.getOpenFileNames(self, title, start_dir, "All files (*)")
         return files
+
+    def refresh(self):
+        self._folders = self._load_folders()
+        if self._current_folder:
+            fid = self._current_folder.get("id")
+            match = next((f for f in self._folders if f.get("id") == fid), self._current_folder)
+            self._current_folder = match
+            self._open_folder(match)
+            return
+        self._build_folder_grid()
 
     def _thumbnail_label(self, full_path, ext, fallback_ico, allow_thumbnail=True):
         thumb = QLabel(fallback_ico)

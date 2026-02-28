@@ -1,9 +1,12 @@
 """Dashboard page"""
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
-                              QLabel, QPushButton, QGridLayout, QFrame, QApplication, QListWidget, QListWidgetItem)
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
+                              QLabel, QPushButton, QGridLayout, QFrame, QApplication, QListWidget, QListWidgetItem, QStyle, QMenu)
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QPropertyAnimation, QEasingCurve, QPoint, QSize
+from PyQt6.QtGui import QPainter, QColor, QPixmap, QIcon
+import time
 from ui.theme import (card_frame, lbl, pill, section_label, action_btn, input_field,
                       toggle_switch, divider, TEAL, CYAN, VIOLET, ROSE,
+                      with_alpha,
                       AMBER, BLUE, TEXT, TEXT_DIM, TEXT_MID, FROST, BORDER)
 from backend.kdeconnect import KDEConnect
 from backend.tailscale import Tailscale
@@ -13,6 +16,7 @@ from backend.ui_feedback import push_toast
 import backend.settings_store as settings
 from backend.clipboard_history import sanitize_clipboard_history
 from backend import audio_route
+import backend.connectivity_controller as connectivity
 
 
 class DndWorker(QThread):
@@ -34,18 +38,29 @@ class DndWorker(QThread):
 class DashboardRefreshWorker(QThread):
     done = pyqtSignal(object)
 
-    def __init__(self, include_media=False):
+    def __init__(self, include_media=False, preferred_media_package: str = ""):
         super().__init__()
         self._include_media = include_media
+        self._preferred_media_package = str(preferred_media_package or "")
 
     def run(self):
         from backend.kdeconnect import KDEConnect
         from backend.adb_bridge import ADBBridge
+        from backend.tailscale import Tailscale
+        from backend.syncthing import Syncthing
+        import backend.settings_store as settings
         result = {
             "battery": None,
             "network_type": None,
             "signal_strength": None,
             "media": None,
+            "tailscale": False,
+            "tailscale_ip": None,
+            "kde_enabled": True,
+            "kde_reachable": False,
+            "syncthing": False,
+            "wifi_enabled": None,
+            "bt_enabled": None,
         }
         kc = KDEConnect()
         adb = ADBBridge()
@@ -59,12 +74,62 @@ class DashboardRefreshWorker(QThread):
         except Exception:
             result["network_type"] = None
             result["signal_strength"] = None
+        try:
+            ts = Tailscale()
+            result["tailscale"] = bool(ts.is_connected())
+            if settings.get("tailscale_force_off", False) and result["tailscale"]:
+                ts.down()
+                result["tailscale"] = bool(ts.is_connected())
+            result["tailscale_ip"] = ts.get_self_ip()
+        except Exception:
+            result["tailscale"] = False
+            result["tailscale_ip"] = None
+        try:
+            result["kde_enabled"] = bool(settings.get("kde_integration_enabled", True))
+            result["kde_reachable"] = bool(result["kde_enabled"] and kc.is_reachable())
+        except Exception:
+            result["kde_enabled"] = bool(settings.get("kde_integration_enabled", True))
+            result["kde_reachable"] = False
+        try:
+            result["syncthing"] = bool(Syncthing().is_running())
+        except Exception:
+            result["syncthing"] = False
+        try:
+            result["wifi_enabled"] = adb.get_wifi_enabled()
+        except Exception:
+            result["wifi_enabled"] = None
+        try:
+            result["bt_enabled"] = adb.get_bluetooth_enabled()
+        except Exception:
+            result["bt_enabled"] = None
         if self._include_media:
             try:
-                result["media"] = adb.get_now_playing()
+                result["media"] = adb.get_now_playing(preferred_package=self._preferred_media_package)
             except Exception:
                 result["media"] = None
         self.done.emit(result)
+
+
+class ToggleActionWorker(QThread):
+    done = pyqtSignal(bool, str, object)
+
+    def __init__(self, action):
+        super().__init__()
+        self._action = action
+
+    def run(self):
+        try:
+            out = self._action()
+            if isinstance(out, tuple) and len(out) >= 3:
+                ok, msg, actual = out[0], out[1], out[2]
+            elif isinstance(out, tuple) and len(out) == 2:
+                ok, msg = out
+                actual = None
+            else:
+                ok, msg, actual = bool(out), "", None
+        except Exception as e:
+            ok, msg, actual = False, str(e), None
+        self.done.emit(bool(ok), str(msg or ""), actual)
 
 
 class DashboardPage(QWidget):
@@ -84,9 +149,24 @@ class DashboardPage(QWidget):
         self._refresh_busy = False
         self._last_media_refresh = 0.0
         self._now_playing_pkg = ""
+        self._toggle_worker = None
+        self._play_is_playing = False
+        self._media_sessions = []
+        self._active_media_pkg_pref = ""
         self._build()
+        from backend.state import state
+        state.subscribe("audio_redirect_enabled", self._on_audio_redirect_state_changed)
+        state.subscribe("connectivity_ops_busy", self._on_connectivity_ops_busy)
         self._sync_audio_route_toggle()
         self.refresh()
+
+    def _on_audio_redirect_state_changed(self, enabled):
+        if hasattr(self, "_audio_row"):
+            t = getattr(self._audio_row, "_toggle", None)
+            if t is not None:
+                t.blockSignals(True)
+                t.setChecked(bool(enabled))
+                t.blockSignals(False)
 
     def _build(self):
         layout = QVBoxLayout(self)
@@ -98,10 +178,10 @@ class DashboardPage(QWidget):
         hero.setStyleSheet("""
             QFrame {
                 background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                    stop:0 rgba(62,240,176,0.07),
+                    stop:0 rgba(167,139,250,0.07),
                     stop:0.5 rgba(167,139,250,0.07),
                     stop:1 rgba(59,130,246,0.05));
-                border: 1px solid rgba(62,240,176,0.15);
+                border: 1px solid rgba(167,139,250,0.15);
                 border-radius: 20px;
             }
         """)
@@ -115,8 +195,8 @@ class DashboardPage(QWidget):
         orb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         orb.setStyleSheet("""
             QLabel {
-                background: rgba(62,240,176,0.1);
-                border: 1px solid rgba(62,240,176,0.22);
+                background: rgba(167,139,250,0.1);
+                border: 1px solid rgba(167,139,250,0.22);
                 border-radius: 17px;
                 font-size: 26px;
             }
@@ -137,9 +217,11 @@ class DashboardPage(QWidget):
         # Pills
         pills_row = QHBoxLayout()
         pills_row.setSpacing(8)
-        pills_row.addWidget(pill("KDE Connect", TEAL, pulse=True))
-        pills_row.addWidget(pill("Tailscale · mesh", VIOLET, pulse=True))
-        self._sync_pill = pill("Syncthing", CYAN, pulse=True)
+        self._kde_pill = pill("KDE Connect", TEXT_MID, pulse=False)
+        self._ts_pill = pill("Tailscale", TEXT_MID, pulse=False)
+        pills_row.addWidget(self._kde_pill)
+        pills_row.addWidget(self._ts_pill)
+        self._sync_pill = pill("Syncthing", TEXT_MID, pulse=False)
         pills_row.addWidget(self._sync_pill)
         pills_row.addStretch()
         hl.addLayout(pills_row)
@@ -160,7 +242,33 @@ class DashboardPage(QWidget):
         npl = QVBoxLayout(now_frame)
         npl.setContentsMargins(20,16,20,16)
         npl.setSpacing(10)
-        npl.addWidget(section_label("Now Playing"))
+        np_head = QHBoxLayout()
+        np_head.setSpacing(8)
+        np_head.addWidget(section_label("Now Playing"))
+        np_head.addStretch()
+        self._player_switch_btn = QPushButton("➜")
+        self._player_switch_btn.setFixedSize(26, 26)
+        self._player_switch_btn.setToolTip("Switch active player")
+        self._player_switch_btn.setEnabled(False)
+        self._player_switch_btn.setText("•")
+        self._player_switch_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.14);
+                border-radius: 8px;
+                color: {TEXT_DIM};
+                font-size: 13px;
+                font-weight: 700;
+            }}
+            QPushButton:hover {{
+                background: {with_alpha(VIOLET, 0.10)};
+                border-color: {with_alpha(VIOLET, 0.42)};
+                color: {TEXT};
+            }}
+        """)
+        self._player_switch_btn.clicked.connect(self._show_player_switch_menu)
+        np_head.addWidget(self._player_switch_btn)
+        npl.addLayout(np_head)
 
         self._np_title = lbl("Nothing playing right now", 14, bold=True)
         self._np_sub = lbl("Playback sessions from phone apps appear here", 11, TEXT_DIM)
@@ -169,15 +277,15 @@ class DashboardPage(QWidget):
 
         np_ctrl = QHBoxLayout()
         np_ctrl.setSpacing(8)
-        prev_btn = action_btn("Prev", CYAN)
+        prev_btn = self._media_icon_btn("prev", VIOLET)
         prev_btn.clicked.connect(lambda: self._media_cmd("prev"))
-        play_btn = action_btn("Play/Pause", TEAL)
-        play_btn.clicked.connect(lambda: self._media_cmd("toggle"))
-        next_btn = action_btn("Next", CYAN)
+        self._play_btn = self._media_icon_btn("play", VIOLET)
+        self._play_btn.clicked.connect(lambda: self._media_cmd("toggle"))
+        next_btn = self._media_icon_btn("next", VIOLET)
         next_btn.clicked.connect(lambda: self._media_cmd("next"))
-        stop_btn = action_btn("Kill App", ROSE)
+        stop_btn = self._media_icon_btn("stop", VIOLET)
         stop_btn.clicked.connect(lambda: self._media_cmd("kill"))
-        for b in (prev_btn, play_btn, next_btn, stop_btn):
+        for b in (prev_btn, self._play_btn, next_btn, stop_btn):
             np_ctrl.addWidget(b)
         np_ctrl.addStretch()
         npl.addLayout(np_ctrl)
@@ -195,7 +303,7 @@ class DashboardPage(QWidget):
 
         self._dnd_btn = None
         actions = [
-            ("◌", "Ring Phone",      TEAL,   self._ring),
+            ("✆", "Ring Phone",      TEAL,   self._ring),
             ("⌧", "Lock Phone",      VIOLET, self._lock_phone),
             ("☎", "Calls Panel",     CYAN,   self._go_calls),
             ("▤", "View Clipboard",  TEAL,   self._view_clipboard),
@@ -208,26 +316,26 @@ class DashboardPage(QWidget):
             btn.setStyleSheet(f"""
                 QPushButton {{
                     background: rgba(255,255,255,0.03);
-                    border: 1px solid rgba(255,255,255,0.07);
+                    border: 1px solid rgba(255,255,255,0.10);
                     border-radius: 14px;
-                    color: rgba(255,255,255,0.60);
+                    color: {TEXT_MID};
                     font-size: 11px;
                     padding: 8px 4px;
                     line-height: 1.4;
                 }}
                 QPushButton:hover {{
-                    background: {TEAL}12;
-                    border-color: {TEAL}44;
+                    background: {with_alpha(VIOLET, 0.10)};
+                    border-color: {with_alpha(VIOLET, 0.42)};
                     color: {TEXT};
                 }}
                 QPushButton:pressed {{
-                    background: {TEAL}1F;
-                    border-color: {TEAL}66;
+                    background: {with_alpha(VIOLET, 0.16)};
+                    border-color: {with_alpha(VIOLET, 0.56)};
                 }}
                 QPushButton:checked {{
-                    background: {TEAL}1A;
-                    border-color: {TEAL}55;
-                    color: {TEAL};
+                    background: {with_alpha(VIOLET, 0.18)};
+                    border-color: {with_alpha(VIOLET, 0.56)};
+                    color: {TEXT};
                 }}
             """)
             btn.clicked.connect(cb)
@@ -247,12 +355,6 @@ class DashboardPage(QWidget):
         cl = QVBoxLayout(conn_frame)
         cl.setContentsMargins(0,8,0,8)
         cl.setSpacing(0)
-        cl.addWidget(self._conn_row("🔗","Tailscale VPN",
-                                    "100.127.0.90 · mesh active", True, TEAL))
-        cl.addWidget(divider())
-        cl.addWidget(self._conn_row("📶","KDE Connect",
-                                    "LAN + Tailscale fallback", True, TEAL))
-        cl.addWidget(divider())
         self._audio_row = self._conn_row(
             "🔊",
             "Phone Audio to PC",
@@ -269,15 +371,83 @@ class DashboardPage(QWidget):
         cl.addWidget(self._wifi_row)
         cl.addWidget(divider())
         self._bt_row = self._conn_row("🦷","Bluetooth",
-                                    "Auto-connect phone profile when enabled", True, VIOLET,
+                                    "Phone Bluetooth radio", True, VIOLET,
                                     on_toggle=self._toggle_bluetooth_action)
         cl.addWidget(self._bt_row)
         cl.addWidget(divider())
-        cl.addWidget(self._conn_row("📡","Mobile Hotspot",
+        self._hs_row = self._conn_row("📡","Mobile Hotspot",
                                     "Off · toggle via ADB", False, CYAN,
-                                    on_toggle=self._hotspot))
+                                    on_toggle=self._hotspot)
+        cl.addWidget(self._hs_row)
         layout.addWidget(conn_frame)
         layout.addStretch()
+
+    def _media_icon_btn(self, icon_name, color):
+        b = QPushButton("")
+        b.setFixedSize(42, 42)
+        b.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.14);
+                border-radius: 12px;
+                padding: 0;
+            }}
+            QPushButton:hover {{
+                background: {with_alpha(VIOLET, 0.10)};
+                border-color: {with_alpha(VIOLET, 0.42)};
+            }}
+            QPushButton:pressed {{
+                background: {with_alpha(VIOLET, 0.16)};
+                border-color: {with_alpha(VIOLET, 0.56)};
+            }}
+        """)
+        b.setIconSize(QSize(18, 18))
+        self._set_media_button_icon(b, icon_name)
+        b.pressed.connect(lambda btn=b: self._animate_media_btn(btn, down=True))
+        b.released.connect(lambda btn=b: self._animate_media_btn(btn, down=False))
+        return b
+
+    def _set_media_button_icon(self, button, icon_name: str):
+        style = QApplication.style()
+        mapping = {
+            "prev": QStyle.StandardPixmap.SP_MediaSeekBackward,
+            "play": QStyle.StandardPixmap.SP_MediaPlay,
+            "pause": QStyle.StandardPixmap.SP_MediaPause,
+            "next": QStyle.StandardPixmap.SP_MediaSeekForward,
+            "stop": QStyle.StandardPixmap.SP_MediaStop,
+        }
+        sp = mapping.get(icon_name, QStyle.StandardPixmap.SP_MediaPlay)
+        base_icon = style.standardIcon(sp)
+        size = button.iconSize()
+        src = base_icon.pixmap(size)
+        if src.isNull():
+            button.setIcon(base_icon)
+            return
+        tinted = QPixmap(src.size())
+        tinted.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(tinted)
+        painter.drawPixmap(0, 0, src)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+        painter.fillRect(tinted.rect(), QColor(VIOLET))
+        painter.end()
+        button.setIcon(QIcon(tinted))
+
+    def _animate_media_btn(self, btn, down):
+        anim = QPropertyAnimation(btn, b"pos", btn)
+        anim.setDuration(90)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        p = btn.pos()
+        target = p + QPoint(0, 1) if down else p - QPoint(0, 1)
+        anim.setStartValue(p)
+        anim.setEndValue(target)
+        anim.start()
+        btn._press_anim = anim
+
+    def _set_play_toggle_icon(self, media_state: str):
+        state = (media_state or "").strip().lower()
+        self._play_is_playing = state in {"playing", "active"}
+        if hasattr(self, "_play_btn") and self._play_btn is not None:
+            self._set_media_button_icon(self._play_btn, "pause" if self._play_is_playing else "play")
 
     def _stat(self, label_text, val, color, sub):
         f = card_frame(hover=False)
@@ -310,7 +480,8 @@ class DashboardPage(QWidget):
         info = QVBoxLayout()
         info.setSpacing(2)
         info.addWidget(lbl(name, 13, TEXT, bold=True))
-        info.addWidget(lbl(sub, 11, TEXT_DIM))
+        sub_lbl = lbl(sub, 11, TEXT_DIM)
+        info.addWidget(sub_lbl)
         row.addLayout(info)
         row.addStretch()
         t = toggle_switch(on, color)
@@ -318,23 +489,169 @@ class DashboardPage(QWidget):
             t.toggled.connect(on_toggle)
         row.addWidget(t)
         w._toggle = t
+        w._sub = sub_lbl
         return w
 
-    def refresh(self):
+    def _set_conn_row_state(self, row, enabled, detail=None):
+        if hasattr(row, "_toggle"):
+            try:
+                row._toggle.blockSignals(True)
+                row._toggle.setChecked(bool(enabled))
+                row._toggle.blockSignals(False)
+            except RuntimeError:
+                pass
+        if detail is not None and hasattr(row, "_sub"):
+            try:
+                row._sub.setText(str(detail))
+            except RuntimeError:
+                pass
+
+    def _set_pill(self, widget, text, color):
+        if widget is None:
+            return
+        widget.setStyleSheet(
+            f"""
+            QWidget {{
+                color:{color};
+                background:transparent;
+                border:none;
+                border-radius:0px;
+            }}
+        """
+        )
+        txt = getattr(widget, "_text_label", None)
+        if txt is not None:
+            txt.setText(text)
+            txt.setStyleSheet(
+                f"font-size:10px;font-family:monospace;background:transparent;border:none;color:{color};"
+            )
+        dot = getattr(widget, "_dot_widget", None)
+        if dot is not None:
+            dot.setStyleSheet(f"background:{color};border:none;border-radius:3px;")
+
+    def _set_status_pill(self, widget, label, state_name):
+        state_map = {
+            "connected": (TEXT_MID, "Connected"),
+            "connecting": (TEXT_DIM, "Checking"),
+            "disconnected": (TEXT_DIM, "Offline"),
+        }
+        color, suffix = state_map.get(state_name, state_map["disconnected"])
+        self._set_pill(widget, f"{label} · {suffix}", color)
+
+    def refresh(self, *, force_media: bool = False):
         if self._refresh_busy:
             self._probe_dnd_state_async()
             return
-        import time
-        include_media = (time.time() - self._last_media_refresh) > 20
+        include_media = bool(force_media or (time.time() - self._last_media_refresh) > 20)
         self._refresh_busy = True
-        self._refresh_worker = DashboardRefreshWorker(include_media=include_media)
-        self._refresh_worker.done.connect(lambda data: self._apply_refresh(data, include_media))
-        self._refresh_worker.finished.connect(self._refresh_worker.deleteLater)
-        self._refresh_worker.start()
+        worker = DashboardRefreshWorker(
+            include_media=include_media,
+            preferred_media_package=self._active_media_pkg_pref,
+        )
+        self._refresh_worker = worker
+        worker.done.connect(lambda data: self._apply_refresh(data, include_media))
+        worker.finished.connect(lambda: self._on_refresh_worker_finished(worker))
+        worker.start()
         self._probe_dnd_state_async()
+
+    def _on_refresh_worker_finished(self, worker):
+        if self._refresh_worker is worker:
+            self._refresh_worker = None
+        self._refresh_busy = False
+        try:
+            worker.deleteLater()
+        except RuntimeError:
+            pass
+
+    @staticmethod
+    def _wait_for_bool(getter, target, timeout_s=3.0, step_s=0.3):
+        end = time.time() + timeout_s
+        last = None
+        while time.time() < end:
+            last = getter()
+            if last is not None and bool(last) == bool(target):
+                return True
+            time.sleep(step_s)
+        return last is not None and bool(last) == bool(target)
+
+    def _set_row_busy(self, row, busy):
+        if hasattr(row, "_toggle"):
+            try:
+                row._toggle.setEnabled(not busy)
+            except RuntimeError:
+                pass
+
+    def _on_connectivity_ops_busy(self, payload):
+        row_map = {
+            "wifi": getattr(self, "_wifi_row", None),
+            "bluetooth": getattr(self, "_bt_row", None),
+        }
+        busy = payload or {}
+        for key, row in row_map.items():
+            if row is None:
+                continue
+            self._set_row_busy(row, bool((busy or {}).get(key, False)))
+
+    def _run_toggle(self, row, action, fallback_label):
+        if self._toggle_worker is not None:
+            try:
+                if self._toggle_worker.isRunning():
+                    return
+            except RuntimeError:
+                self._toggle_worker = None
+        self._set_row_busy(row, True)
+        worker = ToggleActionWorker(action)
+        self._toggle_worker = worker
+        worker.done.connect(lambda ok, msg, actual: self._finish_toggle(row, ok, msg, actual, fallback_label))
+        worker.finished.connect(lambda: self._on_toggle_worker_finished(worker))
+        worker.start()
+
+    def _on_toggle_worker_finished(self, worker):
+        if self._toggle_worker is worker:
+            self._toggle_worker = None
+        try:
+            worker.deleteLater()
+        except RuntimeError:
+            pass
+
+    def _finish_toggle(self, row, ok, msg, actual, fallback_label):
+        self._set_row_busy(row, False)
+        if actual is not None:
+            self._set_conn_row_state(row, bool(actual))
+        if ok:
+            push_toast(msg or "Updated", "success", 1700)
+        else:
+            push_toast(msg or fallback_label, "warning", 1900)
+        QTimer.singleShot(120, self.refresh)
 
     def _apply_refresh(self, data, include_media=False):
         self._refresh_busy = False
+        tailscale_on = bool((data or {}).get("tailscale", False))
+        tailscale_ip = (data or {}).get("tailscale_ip") or "offline"
+        kde_enabled = bool((data or {}).get("kde_enabled", True))
+        kde_reachable = bool((data or {}).get("kde_reachable", False))
+        syncthing_on = bool((data or {}).get("syncthing", False))
+
+        self._set_status_pill(
+            self._ts_pill,
+            "Tailscale",
+            "connected" if tailscale_on else ("connecting" if self._toggle_worker is not None else "disconnected"),
+        )
+        self._set_status_pill(
+            self._kde_pill,
+            "KDE Connect",
+            "connected" if (kde_enabled and kde_reachable) else ("disconnected" if not kde_enabled else "connecting"),
+        )
+        self._set_status_pill(
+            self._sync_pill,
+            "Syncthing",
+            "connected" if syncthing_on else "disconnected",
+        )
+        self._device_sub_lbl.setText(
+            f"{tailscale_ip} · KDE {'reachable' if kde_reachable else ('disabled' if not kde_enabled else 'offline')} · "
+            f"Syncthing {'running' if syncthing_on else 'stopped'}"
+        )
+
         bat = (data or {}).get("battery") or {}
         if bat and bat.get("charge", -1) >= 0:
             charge = int(bat.get("charge", 0))
@@ -351,20 +668,16 @@ class DashboardPage(QWidget):
             self._sig_card[1].setText(str(net))
             bars = "▂▄▆█" if strength >= 4 else "▂▄▆_" if strength == 3 else "▂▄__" if strength == 2 else "▂___"
             self._sig_card[2].setText(bars)
-        wifi_enabled = self.adb.get_wifi_enabled()
-        if wifi_enabled is not None and hasattr(self, "_wifi_row"):
-            t = getattr(self._wifi_row, "_toggle", None)
-            if t is not None:
-                t.blockSignals(True)
-                t.setChecked(bool(wifi_enabled))
-                t.blockSignals(False)
-        bt_enabled = self.adb.get_bluetooth_enabled()
-        if bt_enabled is not None and hasattr(self, "_bt_row"):
-            t = getattr(self._bt_row, "_toggle", None)
-            if t is not None:
-                t.blockSignals(True)
-                t.setChecked(bool(bt_enabled))
-                t.blockSignals(False)
+        wifi_enabled = (data or {}).get("wifi_enabled")
+        if wifi_enabled is None:
+            self._set_conn_row_state(self._wifi_row, False, "Unknown (phone unreachable)")
+        else:
+            self._set_conn_row_state(self._wifi_row, bool(wifi_enabled), "Phone Wi-Fi radio")
+        bt_enabled = (data or {}).get("bt_enabled")
+        if bt_enabled is None:
+            self._set_conn_row_state(self._bt_row, False, "Unknown (phone unreachable)")
+        else:
+            self._set_conn_row_state(self._bt_row, bool(bt_enabled), "Phone Bluetooth radio")
 
         self._sync_audio_route_toggle()
 
@@ -373,16 +686,30 @@ class DashboardPage(QWidget):
             self._last_media_refresh = time.time()
             media = (data or {}).get("media")
             if media:
+                self._media_sessions = list(media.get("sessions") or [])
+                if self._active_media_pkg_pref:
+                    found = any(
+                        (s.get("package") or "") == self._active_media_pkg_pref for s in self._media_sessions
+                    )
+                    if not found:
+                        self._active_media_pkg_pref = ""
                 self._now_playing_pkg = media.get("package", "")
+                if self._now_playing_pkg and not self._active_media_pkg_pref:
+                    self._active_media_pkg_pref = self._now_playing_pkg
                 title = media.get("title") or media.get("session_name") or media.get("package") or "Playing"
                 artist = media.get("artist") or media.get("album") or media.get("package", "")
-                state = (media.get("state") or "unknown").replace("_", " ")
+                media_state = (media.get("state") or "unknown").replace("_", " ")
                 self._np_title.setText(title)
-                self._np_sub.setText(f"{artist} · {state}")
+                self._np_sub.setText(f"{artist} · {media_state}")
+                self._set_play_toggle_icon(media.get("state") or "")
+                self._sync_player_switch_button()
             else:
                 self._now_playing_pkg = ""
+                self._media_sessions = []
                 self._np_title.setText("Nothing playing right now")
                 self._np_sub.setText("Playback sessions from phone apps appear here")
+                self._set_play_toggle_icon("paused")
+                self._sync_player_switch_button()
 
     def update_battery(self, charge, is_charging):
         suffix = " ⚡" if is_charging else "%"
@@ -438,7 +765,7 @@ class DashboardPage(QWidget):
                 border-radius:6px;
             }
             QListWidget::item:selected {
-                background:rgba(62,240,176,0.16);
+                background:rgba(167,139,250,0.16);
             }
         """)
         history_list.setMinimumWidth(300)
@@ -531,7 +858,6 @@ class DashboardPage(QWidget):
             window.go_to("calls")
 
     def _sync_audio_route_toggle(self):
-        enabled = bool(settings.get("audio_redirect", False))
         mirror_running = False
         win = self.window()
         if win and hasattr(win, "get_page"):
@@ -542,58 +868,65 @@ class DashboardPage(QWidget):
                 except Exception:
                     mirror_running = False
 
-        if enabled and not mirror_running:
-            if not audio_route.start(self.adb):
-                enabled = False
-                settings.set("audio_redirect", False)
-        elif not enabled:
-            audio_route.stop()
-
-        if hasattr(self, "_audio_row"):
-            t = getattr(self._audio_row, "_toggle", None)
-            if t is not None and t.isChecked() != enabled:
-                t.blockSignals(True)
-                t.setChecked(enabled)
-                t.blockSignals(False)
+        audio_route.sync(self.adb, suspend_ui_global=mirror_running)
 
     def _toggle_audio_route_action(self, checked=False):
         target = bool(checked)
-        settings.set("audio_redirect", target)
+        if not target:
+            # Deterministic hard-off: clear all route sources/backends.
+            audio_route.clear_all()
+        else:
+            audio_route.set_source("ui_global_toggle", target)
 
         win = self.window()
         mirror = win.get_page("mirror") if win and hasattr(win, "get_page") else None
         if mirror and hasattr(mirror, "sync_global_audio_state"):
-            # Mirror page owns runtime behavior while mirror stream is active.
             mirror.sync_global_audio_state(force=True, quiet=True)
-            final = bool(settings.get("audio_redirect", False))
-            if hasattr(mirror, "refresh"):
-                mirror.refresh()
         else:
-            final = bool(audio_route.set_enabled(target, adb=self.adb))
+            self._sync_audio_route_toggle()
 
-        self._sync_audio_route_toggle()
+        from backend.state import state
+        final = state.get("audio_redirect_enabled", False)
         if final:
             push_toast("Phone audio routing enabled globally", "success", 1800)
         else:
-            push_toast("Phone audio routing disabled", "warning" if target else "info", 1800)
+            push_toast("Phone audio routing disabled", "info", 1800)
+
+    def _toggle_tailscale_action(self, checked=False):
+        if not hasattr(self, "_ts_row"):
+            return
+        target = bool(checked)
+
+        def _action():
+            return connectivity.set_tailscale(target)
+
+        self._run_toggle(self._ts_row, _action, "Tailscale toggle failed")
+
+    def _toggle_kde_action(self, checked=False):
+        if not hasattr(self, "_kde_row"):
+            return
+        target = bool(checked)
+
+        def _action():
+            return connectivity.set_kde(target, window=self.window())
+
+        self._run_toggle(self._kde_row, _action, "KDE toggle failed")
 
     def _toggle_wifi_action(self, checked=False):
-        ok = self.adb.set_wifi(bool(checked))
-        push_toast("Wi-Fi enabled on phone" if checked else "Wi-Fi disabled on phone", "success" if ok else "warning", 1500)
+        target = bool(checked)
+
+        def _action():
+            return connectivity.set_wifi(target, target=self.adb.target)
+
+        self._run_toggle(self._wifi_row, _action, "Wi-Fi toggle failed")
 
     def _toggle_bluetooth_action(self, checked=False):
-        enabled = bool(checked)
-        ok = self.adb.set_bluetooth(enabled)
-        push_toast("Bluetooth enabled on phone" if enabled else "Bluetooth disabled on phone", "success" if ok else "warning", 1500)
-        if enabled and settings.get("auto_bt_connect", True):
-            hints = [
-                settings.get("device_name", ""),
-                "nothing",
-                "phone",
-                "a059",
-            ]
-            c_ok, msg = self.bt.auto_connect_phone(hints)
-            push_toast(msg, "success" if c_ok else "warning", 1900)
+        target = bool(checked)
+
+        def _action():
+            return connectivity.set_bluetooth(target, target=self.adb.target)
+
+        self._run_toggle(self._bt_row, _action, "Bluetooth toggle failed")
 
     def _toggle_dnd(self):
         if self._dnd_busy:
@@ -656,12 +989,51 @@ class DashboardPage(QWidget):
             self._dnd_btn.setChecked(actual_bool)
 
     def _media_cmd(self, action):
+        target_pkg = str(self._active_media_pkg_pref or self._now_playing_pkg or "")
+        if target_pkg and target_pkg != self._now_playing_pkg and action in {"prev", "toggle", "next"}:
+            self.adb.launch_app(target_pkg)
         if action == "prev":
             self.adb.media_prev()
         elif action == "toggle":
             self.adb.media_play_pause()
+            self._play_is_playing = not self._play_is_playing
+            if hasattr(self, "_play_btn") and self._play_btn is not None:
+                self._set_media_button_icon(self._play_btn, "pause" if self._play_is_playing else "play")
         elif action == "next":
             self.adb.media_next()
         elif action == "kill":
-            self.adb.stop_media_app(self._now_playing_pkg)
-        QTimer.singleShot(350, self.refresh)
+            self.adb.stop_media_app(target_pkg)
+        QTimer.singleShot(250, lambda: self.refresh(force_media=True))
+
+    def _sync_player_switch_button(self):
+        count = len(self._media_sessions or [])
+        self._player_switch_btn.setEnabled(count > 1)
+        self._player_switch_btn.setText("➜" if count > 1 else "•")
+
+    def _show_player_switch_menu(self):
+        sessions = list(self._media_sessions or [])
+        if len(sessions) <= 1:
+            return
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background:#13161d; border:1px solid #252b3b; color:#dde3f0; }"
+            "QMenu::item { padding:7px 12px; }"
+            "QMenu::item:selected { background:rgba(124,108,255,0.22); }"
+        )
+        current_pkg = self._active_media_pkg_pref or self._now_playing_pkg
+        for session in sessions:
+            pkg = str(session.get("package") or "")
+            title = str(session.get("title") or session.get("session_name") or pkg or "Unknown")
+            artist = str(session.get("artist") or "")
+            label = title if not artist else f"{title} — {artist}"
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(bool(pkg and pkg == current_pkg))
+            action.triggered.connect(lambda _, p=pkg: self._select_media_player(p))
+        menu.exec(self._player_switch_btn.mapToGlobal(self._player_switch_btn.rect().bottomRight()))
+
+    def _select_media_player(self, package_name: str):
+        self._active_media_pkg_pref = str(package_name or "")
+        if self._active_media_pkg_pref:
+            self.adb.launch_app(self._active_media_pkg_pref)
+        self.refresh(force_media=True)

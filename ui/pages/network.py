@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import (
     QFrame,
 )
 from PyQt6.QtCore import QThread, pyqtSignal
+import time
 
 from ui.theme import (
     card_frame,
@@ -18,7 +19,6 @@ from ui.theme import (
     VIOLET,
     TEXT_DIM,
 )
-from ui.motion import breathe
 from backend.tailscale import Tailscale
 from backend.syncthing import Syncthing
 from backend.adb_bridge import ADBBridge
@@ -27,6 +27,7 @@ from backend.kdeconnect import KDEConnect
 from backend.ui_feedback import push_toast
 from backend.state import state
 import backend.settings_store as settings
+import backend.connectivity_controller as connectivity
 
 
 class NetworkRefreshWorker(QThread):
@@ -38,11 +39,15 @@ class NetworkRefreshWorker(QThread):
 
     def run(self):
         ts = Tailscale()
+        if settings.get("tailscale_force_off", False) and ts.is_connected():
+            ts.down()
         adb = ADBBridge(self._target)
         st = Syncthing()
         kc = KDEConnect()
         status = ts.get_status() or {}
-        self_ip = ((status.get("Self", {}) or {}).get("TailscaleIPs", []) or [None])[0]
+        backend_state = str(status.get("BackendState") or "").strip()
+        connected = backend_state == "Running"
+        self_ip = ((status.get("Self", {}) or {}).get("TailscaleIPs", []) or [None])[0] if connected else None
         peers = [
             {
                 "name": p.get("HostName", "?"),
@@ -61,8 +66,9 @@ class NetworkRefreshWorker(QThread):
         bt = adb.get_bluetooth_enabled()
         payload = {
             "self_ip": self_ip,
+            "tailscale_state": backend_state,
             "peers": peers,
-            "tailscale": bool(self_ip),
+            "tailscale": bool(connected),
             "kde": kde_enabled,
             "kde_reachable": kde_reachable,
             "syncthing": syncthing_ok,
@@ -70,9 +76,9 @@ class NetworkRefreshWorker(QThread):
             "bt_enabled": bt,
             "connectivity_status": {
                 "tailscale": {
-                    "actual": bool(self_ip),
-                    "reachable": bool(self_ip),
-                    "reason": "mesh active" if self_ip else "not connected",
+                    "actual": bool(connected),
+                    "reachable": bool(connected),
+                    "reason": f"state={backend_state or 'unknown'}",
                 },
                 "kde": {
                     "actual": kde_enabled,
@@ -100,15 +106,25 @@ class NetworkRefreshWorker(QThread):
 
 
 class ToggleActionWorker(QThread):
-    done = pyqtSignal(bool, str)
+    done = pyqtSignal(bool, str, object)
 
     def __init__(self, action):
         super().__init__()
         self._action = action
 
     def run(self):
-        ok, msg = self._action()
-        self.done.emit(bool(ok), str(msg or ""))
+        try:
+            out = self._action()
+            if isinstance(out, tuple) and len(out) >= 3:
+                ok, msg, actual = out[0], out[1], out[2]
+            elif isinstance(out, tuple) and len(out) == 2:
+                ok, msg = out
+                actual = None
+            else:
+                ok, msg, actual = bool(out), "", None
+        except Exception as e:
+            ok, msg, actual = False, str(e), None
+        self.done.emit(bool(ok), str(msg or ""), actual)
 
 
 class NetworkPage(QWidget):
@@ -122,6 +138,7 @@ class NetworkPage(QWidget):
         self._refresh_busy = False
         self._refresh_worker = None
         self._toggle_worker = None
+        state.subscribe("connectivity_ops_busy", self._on_connectivity_ops_busy)
         self._build()
         self.refresh()
 
@@ -148,8 +165,8 @@ class NetworkPage(QWidget):
         ts_frame.setStyleSheet(
             """
             QFrame {
-                background: rgba(255,255,255,0.03);
-                border: 1px solid rgba(255,255,255,0.12);
+                background: rgba(255,255,255,0.05);
+                border: 1px solid rgba(255,255,255,0.14);
                 border-radius: 18px;
             }
         """
@@ -186,7 +203,7 @@ class NetworkPage(QWidget):
 
         self._kc_row = self._conn_toggle("⌁", "KDE Connect", "Signal bridge", True, TEAL, self._toggle_kde)
         self._wifi_row = self._conn_toggle("⌂", "Wi-Fi", "Phone Wi-Fi radio", True, CYAN, self._toggle_wifi)
-        self._bt_row = self._conn_toggle("⌬", "Bluetooth", "Paired fallback", True, VIOLET, self._toggle_bluetooth)
+        self._bt_row = self._conn_toggle("⌬", "Bluetooth", "Phone Bluetooth radio", True, VIOLET, self._toggle_bluetooth)
         self._st_row = self._conn_toggle("↺", "Syncthing", "Folder sync service", True, TEAL, self._toggle_syncthing)
         self._hs_row = self._conn_toggle("◉", "Hotspot", "Open phone hotspot settings", False, CYAN, self._toggle_hotspot)
 
@@ -224,50 +241,105 @@ class NetworkPage(QWidget):
         if not hasattr(row, "_toggle"):
             return
         t = row._toggle
-        t.blockSignals(True)
-        t.setChecked(bool(checked))
-        t.blockSignals(False)
+        try:
+            t.blockSignals(True)
+            t.setChecked(bool(checked))
+            t.blockSignals(False)
+        except RuntimeError:
+            pass
 
     def _set_busy(self, row, busy):
         if not hasattr(row, "_toggle"):
             return
-        row._toggle.setEnabled(not busy)
+        try:
+            row._toggle.setEnabled(not busy)
+        except RuntimeError:
+            pass
 
     def _run_toggle(self, row, action, fallback_label):
-        if self._toggle_worker and self._toggle_worker.isRunning():
-            return
+        if self._toggle_worker is not None:
+            try:
+                if self._toggle_worker.isRunning():
+                    return
+            except RuntimeError:
+                self._toggle_worker = None
         self._set_busy(row, True)
-        self._toggle_worker = ToggleActionWorker(action)
-        self._toggle_worker.done.connect(lambda ok, msg: self._finish_toggle(row, ok, msg, fallback_label))
-        self._toggle_worker.finished.connect(self._toggle_worker.deleteLater)
-        self._toggle_worker.start()
+        worker = ToggleActionWorker(action)
+        self._toggle_worker = worker
+        worker.done.connect(lambda ok, msg, actual: self._finish_toggle(row, ok, msg, actual, fallback_label))
+        worker.finished.connect(lambda: self._on_toggle_worker_finished(worker))
+        worker.start()
 
-    def _finish_toggle(self, row, ok, msg, fallback_label):
+    def _on_toggle_worker_finished(self, worker):
+        if self._toggle_worker is worker:
+            self._toggle_worker = None
+        try:
+            worker.deleteLater()
+        except RuntimeError:
+            pass
+
+    def _finish_toggle(self, row, ok, msg, actual, fallback_label):
         self._set_busy(row, False)
+        if actual is not None:
+            self._set_toggle_state(row, bool(actual))
+        if (not ok) and msg and "sudo tailscale set --operator=$USER" in msg:
+            try:
+                from PyQt6.QtWidgets import QApplication
+                QApplication.clipboard().setText("sudo tailscale set --operator=$USER")
+                msg = f"{msg}\n(Command copied to clipboard)"
+            except Exception:
+                pass
         if ok:
             push_toast(msg or "Updated", "success", 1500)
         else:
             push_toast(msg or fallback_label, "warning", 1900)
+        if row is self._hs_row:
+            self._set_toggle_state(self._hs_row, False)
         self.refresh()
+
+    def _on_connectivity_ops_busy(self, payload):
+        busy = payload or {}
+        row_map = {
+            "wifi": getattr(self, "_wifi_row", None),
+            "bluetooth": getattr(self, "_bt_row", None),
+            "tailscale": getattr(self, "_ts_row", None),
+            "kde": getattr(self, "_kc_row", None),
+            "syncthing": getattr(self, "_st_row", None),
+        }
+        for op, row in row_map.items():
+            if row is None:
+                continue
+            self._set_busy(row, bool((busy or {}).get(op, False)))
 
     def refresh(self):
         if self._refresh_busy:
             return
         self._refresh_busy = True
-        self._refresh_worker = NetworkRefreshWorker(self.adb.target)
-        self._refresh_worker.done.connect(self._apply_refresh)
-        self._refresh_worker.finished.connect(self._refresh_worker.deleteLater)
-        self._refresh_worker.start()
+        worker = NetworkRefreshWorker(self.adb.target)
+        self._refresh_worker = worker
+        worker.done.connect(self._apply_refresh)
+        worker.finished.connect(lambda: self._on_refresh_worker_finished(worker))
+        worker.start()
+
+    def _on_refresh_worker_finished(self, worker):
+        if self._refresh_worker is worker:
+            self._refresh_worker = None
+        self._refresh_busy = False
+        try:
+            worker.deleteLater()
+        except RuntimeError:
+            pass
 
     def _apply_refresh(self, data):
         self._refresh_busy = False
 
         peers = (data or {}).get("peers", []) or []
         self_ip = (data or {}).get("self_ip")
+        ts_state = str((data or {}).get("tailscale_state") or "").strip()
         if self_ip:
             self._ts_sub.setText(f"{self_ip} · {len(peers)} peers · mesh active")
         else:
-            self._ts_sub.setText("Not connected")
+            self._ts_sub.setText(f"Not connected ({ts_state or 'unknown'})")
 
         self._set_toggle_state(self._ts_row, bool((data or {}).get("tailscale")))
 
@@ -278,7 +350,7 @@ class NetworkPage(QWidget):
 
         for peer in peers:
             row = QWidget()
-            row.setStyleSheet("background:rgba(255,255,255,0.03);border-radius:8px;border:none;")
+            row.setStyleSheet("background:rgba(255,255,255,0.05);border-radius:8px;border:none;")
             rl = QHBoxLayout(row)
             rl.setContentsMargins(12, 8, 12, 8)
             rl.setSpacing(10)
@@ -286,8 +358,6 @@ class NetworkPage(QWidget):
             dot.setFixedSize(8, 8)
             dot_color = TEAL if peer["online"] else TEXT_DIM
             dot.setStyleSheet(f"background:{dot_color};border:none;border-radius:4px;")
-            if peer["online"]:
-                breathe(dot, min_opacity=0.35, max_opacity=1.0)
             rl.addWidget(dot)
             rl.addWidget(lbl(peer["name"], 12, bold=True))
             rl.addStretch()
@@ -306,34 +376,44 @@ class NetworkPage(QWidget):
         wifi_enabled = (data or {}).get("wifi_enabled")
         if wifi_enabled is not None:
             self._set_toggle_state(self._wifi_row, bool(wifi_enabled))
+            self._wifi_row._sub.setText("Phone Wi-Fi radio")
+        else:
+            self._set_toggle_state(self._wifi_row, False)
+            self._wifi_row._sub.setText("Unknown (phone unreachable)")
 
         bt_enabled = (data or {}).get("bt_enabled")
         if bt_enabled is not None:
             self._set_toggle_state(self._bt_row, bool(bt_enabled))
+            self._bt_row._sub.setText("Phone Bluetooth radio")
+        else:
+            self._set_toggle_state(self._bt_row, False)
+            self._bt_row._sub.setText("Unknown (phone unreachable)")
 
         state.set("connectivity_status", (data or {}).get("connectivity_status", {}))
+
+    @staticmethod
+    def _wait_for_bool(getter, target, timeout_s=3.0, step_s=0.35):
+        end = time.time() + timeout_s
+        last = None
+        while time.time() < end:
+            last = getter()
+            if last is not None and bool(last) == bool(target):
+                return True
+            time.sleep(step_s)
+        return last is not None and bool(last) == bool(target)
 
     def _toggle_tailscale(self, checked):
         target = bool(checked)
 
         def _action():
-            cmd_ok = self.ts.set_enabled(target)
-            actual = bool(self.ts.is_connected())
-            if actual != target:
-                return False, "Tailscale did not reach requested state"
-            return cmd_ok, "Tailscale connected" if target else "Tailscale disconnected"
+            return connectivity.set_tailscale(target)
 
         self._run_toggle(self._ts_row, _action, "Tailscale toggle failed")
 
     def _toggle_kde(self, checked):
         target = bool(checked)
-
         def _action():
-            settings.set("kde_integration_enabled", target)
-            actual = bool(settings.get("kde_integration_enabled", True))
-            if actual != target:
-                return False, "KDE toggle failed"
-            return True, "KDE integration enabled" if target else "KDE integration disabled"
+            return connectivity.set_kde(target, window=self.window())
 
         self._run_toggle(self._kc_row, _action, "KDE toggle failed")
 
@@ -341,45 +421,24 @@ class NetworkPage(QWidget):
         target = bool(checked)
 
         def _action():
-            ok = self.st.set_running(target)
-            actual = bool(self.st.is_running())
-            if actual != target:
-                return False, "Syncthing service did not change state"
-            return ok, "Syncthing running" if target else "Syncthing stopped"
+            return connectivity.set_syncthing(target)
 
         self._run_toggle(self._st_row, _action, "Syncthing toggle failed")
 
     def _toggle_hotspot(self, checked):
-        target = bool(checked)
-
         def _action():
-            ok = self.adb.set_hotspot(target)
-            if not ok and target:
-                self.adb.open_hotspot_settings()
-                return False, "Hotspot command unavailable; opened phone settings"
-            if not ok:
-                return False, "Hotspot command failed"
-            return True, "Hotspot enabled" if target else "Hotspot disabled"
+            ok = self.adb.open_hotspot_settings()
+            if ok:
+                return True, "Opened hotspot settings on phone"
+            return False, "Could not open hotspot settings on phone"
 
-        self._run_toggle(self._hs_row, _action, "Hotspot toggle failed")
+        self._run_toggle(self._hs_row, _action, "Hotspot settings action failed")
 
     def _toggle_bluetooth(self, checked):
         target = bool(checked)
 
         def _action():
-            ok = self.adb.set_bluetooth(target)
-            actual = self.adb.get_bluetooth_enabled()
-            if actual is None or bool(actual) != target:
-                return False, "Bluetooth state not confirmed"
-            if target and settings.get("auto_bt_connect", True):
-                hints = [
-                    settings.get("device_name", ""),
-                    "nothing",
-                    "phone",
-                    "a059",
-                ]
-                self.bt.auto_connect_phone(hints)
-            return ok, "Bluetooth enabled" if target else "Bluetooth disabled"
+            return connectivity.set_bluetooth(target, target=self.adb.target)
 
         self._run_toggle(self._bt_row, _action, "Bluetooth toggle failed")
 
@@ -387,10 +446,6 @@ class NetworkPage(QWidget):
         target = bool(checked)
 
         def _action():
-            ok = self.adb.set_wifi(target)
-            actual = self.adb.get_wifi_enabled()
-            if actual is None or bool(actual) != target:
-                return False, "Wi-Fi state not confirmed"
-            return ok, "Wi-Fi enabled" if target else "Wi-Fi disabled"
+            return connectivity.set_wifi(target, target=self.adb.target)
 
         self._run_toggle(self._wifi_row, _action, "Wi-Fi toggle failed")

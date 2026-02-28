@@ -16,46 +16,49 @@ from PyQt6.QtCore import Qt, pyqtSignal, QPropertyAnimation, QEasingCurve, QRect
 # Theme palettes
 _THEMES = {
     "slate": {
-        "accent_primary": "#53D1B0",
-        "accent_success": "#53D1B0",
-        "accent_warning": "#D9B36F",
-        "danger": "#E57A95",
-        "text_primary": "rgba(255,255,255,0.93)",
-        "text_secondary": "rgba(255,255,255,0.64)",
-        "text_dim": "rgba(255,255,255,0.40)",
-        "bg": "#0C1320",
+        "accent_primary": "#53D1FF",
+        "accent_secondary": "#C4B5FD",
+        "accent_success": "#34D399",
+        "accent_warning": "#FBBF24",
+        "danger": "#FB7185",
+        "text_primary": "rgba(241,245,255,0.95)",
+        "text_secondary": "rgba(211,222,242,0.72)",
+        "text_dim": "rgba(198,210,234,0.48)",
+        "bg": "#0B1321",
     },
     "mist": {
-        "accent_primary": "#5DB6B1",
-        "accent_success": "#5DB6B1",
-        "accent_warning": "#C7A267",
-        "danger": "#CF6E86",
-        "text_primary": "rgba(242,246,248,0.95)",
-        "text_secondary": "rgba(232,238,242,0.70)",
-        "text_dim": "rgba(224,232,238,0.45)",
-        "bg": "#122028",
+        "accent_primary": "#53D1FF",
+        "accent_secondary": "#C4B5FD",
+        "accent_success": "#6EE7B7",
+        "accent_warning": "#FCD34D",
+        "danger": "#FB7185",
+        "text_primary": "rgba(242,247,255,0.95)",
+        "text_secondary": "rgba(222,232,246,0.73)",
+        "text_dim": "rgba(203,216,235,0.50)",
+        "bg": "#101B2A",
     },
     "night": {
-        "accent_primary": "#6FD0B8",
-        "accent_success": "#6FD0B8",
-        "accent_warning": "#D1B47B",
-        "danger": "#DE6F8F",
-        "text_primary": "rgba(246,248,255,0.96)",
-        "text_secondary": "rgba(218,225,242,0.72)",
-        "text_dim": "rgba(202,210,230,0.45)",
-        "bg": "#0A0E18",
+        "accent_primary": "#53D1FF",
+        "accent_secondary": "#C4B5FD",
+        "accent_success": "#34D399",
+        "accent_warning": "#FBBF24",
+        "danger": "#F43F5E",
+        "text_primary": "rgba(237,244,255,0.96)",
+        "text_secondary": "rgba(205,217,242,0.72)",
+        "text_dim": "rgba(189,203,232,0.46)",
+        "bg": "#090F1D",
     },
 }
 
 CURRENT_THEME = "slate"
 
 # Backward-compatible color names
-TEAL = "#53D1B0"
-VIOLET = "#9BA3F7"
-CYAN = "#7BBFE8"
-ROSE = "#E57A95"
-AMBER = "#D9B36F"
-BLUE = "#84AEFF"
+TEAL = "#53D1FF"
+VIOLET = "#A78BFA"
+CYAN = "#53D1FF"
+ROSE = "#FB7185"
+AMBER = "#FBBF24"
+BLUE = "#93C5FD"
 BG = "#0C1320"
 BORDER = "rgba(255,255,255,0.10)"
 BORDER2 = "rgba(255,255,255,0.16)"
@@ -71,7 +74,7 @@ MOTION_LEVEL = "rich"
 
 
 def _apply_theme(theme_name: str):
-    global CURRENT_THEME, TEAL, CYAN, ROSE, AMBER, BG, TEXT, TEXT_MID, TEXT_DIM
+    global CURRENT_THEME, TEAL, CYAN, VIOLET, ROSE, AMBER, BG, TEXT, TEXT_MID, TEXT_DIM
     global BORDER, BORDER2, SIDEBAR_STYLE
     name = str(theme_name or "slate").strip().lower()
     if name not in _THEMES:
@@ -80,6 +83,7 @@ def _apply_theme(theme_name: str):
     t = _THEMES[name]
     TEAL = t["accent_primary"]
     CYAN = t["accent_primary"]
+    VIOLET = t.get("accent_secondary", "#A78BFA")
     ROSE = t["danger"]
     AMBER = t["accent_warning"]
     BG = t["bg"]
@@ -176,6 +180,11 @@ def _hex_to_rgb(hex_color: str):
         return 12, 19, 32
 
 
+def with_alpha(hex_color: str, alpha: float) -> str:
+    r, g, b = _hex_to_rgb(hex_color)
+    return _rgba(r, g, b, alpha)
+
+
 def get_app_style(window_opacity_pct: int = 94) -> str:
     root_alpha = max(0.70, min(0.98, window_opacity_pct / 100.0))
     br, bg, bb = _hex_to_rgb(BG)
@@ -205,7 +214,7 @@ QScrollBar:vertical {{
     margin: 0;
 }}
 QScrollBar::handle:vertical {{
-    background: rgba(255,255,255,0.10);
+    background: rgba(255,255,255,0.14);
     border-radius: 2px;
     min-height: 20px;
 }}
@@ -239,27 +248,29 @@ QWidget#sidebar {{
 QPushButton#sb-item {{
     background: transparent;
     border: none;
-    border-radius: 12px;
-    color: {TEXT_DIM};
-    font-size: 16px;
+    border-radius: 8px;
+    color: transparent;
+    font-size: 0px;
+    font-weight: 400;
     padding: 0;
+    margin: 0;
     min-width: 0;
     min-height: 0;
+    outline: none;
 }}
 QPushButton#sb-item:hover {{
-    background: rgba(255,255,255,0.06);
-    color: {TEXT_MID};
+    background: transparent;
+    border: none;
 }}
 QPushButton#sb-item[active=true] {{
-    background: {TEAL}18;
-    border: 1px solid {TEAL}3A;
-    color: {TEAL};
+    background: transparent;
+    border: none;
 }}
 QPushButton#sb-item:focus {{
-    border: 1px solid transparent;
+    border: none;
 }}
 QLabel#sb-logo {{
-    color: {TEAL};
+    color: {VIOLET};
     font-size: 20px;
     background: transparent;
     border: none;
@@ -295,7 +306,7 @@ def card_frame(accent=None, hover=True):
 
 
 def _card_style(accent=False, hover=True):
-    border_color = f"{TEAL}44" if accent else surface_border()
+    border_color = with_alpha(TEAL, 0.28) if accent else surface_border()
     hover_style = (
         f"""
         QFrame:hover {{
@@ -342,7 +353,7 @@ def input_field(placeholder="", password=False):
             font-size: 12px;
         }}
         QLineEdit:focus {{
-            border-color: {TEAL}88;
+            border-color: {with_alpha(TEAL, 0.56)};
             background: rgba(255,255,255,0.08);
         }}
     """
@@ -365,7 +376,7 @@ def text_area(placeholder="", height=80):
             font-size: 12px;
         }}
         QTextEdit:focus {{
-            border-color: {TEAL}88;
+            border-color: {with_alpha(TEAL, 0.56)};
         }}
     """
     )
@@ -376,17 +387,25 @@ def _button_style(color, role="secondary"):
     if role == "danger":
         color = ROSE
     if role == "primary":
-        bg = f"{TEAL}2E"
-        border = f"{TEAL}70"
-        hover_bg = f"{TEAL}40"
+        color = VIOLET
+        bg = with_alpha(VIOLET, 0.20)
+        border = with_alpha(VIOLET, 0.46)
+        hover_bg = with_alpha(VIOLET, 0.28)
+        pressed_bg = with_alpha(VIOLET, 0.34)
+        hover_border = with_alpha(VIOLET, 0.58)
     elif role == "danger":
-        bg = f"{ROSE}28"
-        border = f"{ROSE}66"
-        hover_bg = f"{ROSE}3F"
+        bg = with_alpha(ROSE, 0.14)
+        border = with_alpha(ROSE, 0.34)
+        hover_bg = with_alpha(ROSE, 0.22)
+        pressed_bg = with_alpha(ROSE, 0.30)
+        hover_border = with_alpha(ROSE, 0.50)
     else:
-        bg = _rgba(255, 255, 255, 0.08)
-        border = _rgba(255, 255, 255, 0.16)
-        hover_bg = _rgba(255, 255, 255, 0.14)
+        color = color or CYAN
+        bg = _rgba(255, 255, 255, 0.05)
+        border = _rgba(255, 255, 255, 0.14)
+        hover_bg = with_alpha(VIOLET, 0.12)
+        pressed_bg = with_alpha(VIOLET, 0.18)
+        hover_border = with_alpha(VIOLET, 0.42)
     return f"""
         QPushButton {{
             background:{bg};border:1px solid {border};
@@ -394,10 +413,10 @@ def _button_style(color, role="secondary"):
             padding:9px 14px;font-size:12px;font-weight:500;
         }}
         QPushButton:hover {{
-            background:{hover_bg};border-color:{color}88;
+            background:{hover_bg};border-color:{hover_border};
         }}
         QPushButton:pressed {{
-            background:{color}30;
+            background:{pressed_bg};border-color:{hover_border};
         }}
         QPushButton:disabled {{
             color:{TEXT_DIM};
@@ -428,10 +447,11 @@ def danger_btn(text, icon=""):
 class AnimatedSwitch(QWidget):
     toggled = pyqtSignal(bool)
 
-    def __init__(self, on=False, color=TEAL, parent=None):
+    def __init__(self, on=False, color=VIOLET, parent=None):
         super().__init__(parent)
         self._checked = bool(on)
-        self._color = color
+        # Keep toggles visually deterministic across the app.
+        self._color = "#a78bfa"
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedSize(44, 24)
 
@@ -467,10 +487,13 @@ class AnimatedSwitch(QWidget):
 
     def _refresh(self, animated=True):
         on = bool(self._checked)
-        active = TEAL
-        track_bg = f"{active}44" if on else "rgba(255,255,255,0.08)"
-        track_border = f"{active}99" if on else "rgba(255,255,255,0.16)"
+        active = "#a78bfa"
+        track_bg = with_alpha(active, 0.26) if on else "rgba(255,255,255,0.08)"
+        track_border = with_alpha(active, 0.58) if on else "rgba(255,255,255,0.16)"
         self._track.setStyleSheet(f"background:{track_bg};border:1px solid {track_border};border-radius:12px;")
+        self._knob.setStyleSheet(
+            f"background:{active if on else 'rgba(255,255,255,0.92)'};border:none;border-radius:9px;"
+        )
         target = QRect(23, 3, 18, 18) if on else QRect(3, 3, 18, 18)
         if not animated or MOTION_LEVEL == "static":
             self._knob.setGeometry(target)
@@ -485,12 +508,12 @@ class AnimatedSwitch(QWidget):
 class ToggleProxy(QWidget):
     toggled = pyqtSignal(bool)
 
-    def __init__(self, on=False, color=TEAL, parent=None):
+    def __init__(self, on=False, color=VIOLET, parent=None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        self._switch = AnimatedSwitch(on=on, color=color)
+        self._switch = AnimatedSwitch(on=on, color=VIOLET)
         self._switch.toggled.connect(self.toggled.emit)
         layout.addWidget(self._switch)
 
@@ -501,8 +524,8 @@ class ToggleProxy(QWidget):
         self._switch.setChecked(value)
 
 
-def toggle_switch(on=False, color=TEAL):
-    return ToggleProxy(on=on, color=color)
+def toggle_switch(on=False, color=VIOLET):
+    return ToggleProxy(on=on, color=VIOLET)
 
 
 def pill(text, color=TEAL, pulse=False):
@@ -511,8 +534,8 @@ def pill(text, color=TEAL, pulse=False):
         f"""
         QWidget {{
             color:{color};
-            background:{color}14;
-            border:1px solid {color}33;
+            background:rgba(255,255,255,0.04);
+            border:1px solid rgba(255,255,255,0.12);
             border-radius:99px;
         }}
     """
@@ -527,6 +550,8 @@ def pill(text, color=TEAL, pulse=False):
     text_lbl = QLabel(f"{text}")
     text_lbl.setStyleSheet("font-size:10px;font-family:monospace;background:transparent;border:none;")
     row.addWidget(text_lbl)
+    w._dot_widget = dot
+    w._text_label = text_lbl
     if pulse:
         try:
             from ui.motion import breathe
@@ -562,7 +587,7 @@ class ToggleRow(QWidget):
 
     toggled = pyqtSignal(bool)
 
-    def __init__(self, icon, name, desc="", checked=False, color=TEAL, parent=None):
+    def __init__(self, icon, name, desc="", checked=False, color=VIOLET, parent=None):
         super().__init__(parent)
         self.setStyleSheet("background:transparent;border:none;")
         layout = QHBoxLayout(self)
@@ -581,7 +606,7 @@ class ToggleRow(QWidget):
         layout.addLayout(info)
         layout.addStretch()
 
-        self.toggle = toggle_switch(checked, color)
+        self.toggle = toggle_switch(checked, VIOLET)
         self.toggle.toggled.connect(self.toggled.emit)
         layout.addWidget(self.toggle)
 

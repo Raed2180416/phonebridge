@@ -1,249 +1,498 @@
-"""Startup connectivity checker."""
+"""Startup connectivity check popup and worker."""
+
+from __future__ import annotations
+
 import json
 import subprocess
+import threading
+from typing import Callable
 
 import httpx
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QPoint, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QDialog,
-    QVBoxLayout,
+    QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QFrame,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtCore import Qt, QTimer
 
 import backend.settings_store as settings
+
 
 API_KEY = "fCtXuD2RX3d52R7CMTfbzynGmNrHYFQ5"
 
 
-class ConnectivityChecker:
-    def check_tailscale(self):
+PILL_STYLES = {
+    "checking": "background: rgba(78,90,114,.12); border: 1px solid rgba(78,90,114,.2); color: #4e5a72;",
+    "online": "background: rgba(34,197,94,.10); border: 1px solid rgba(34,197,94,.22); color: #22c55e;",
+    "starting": "background: rgba(240,180,41,.10); border: 1px solid rgba(240,180,41,.22); color: #f0b429;",
+    "offline": "background: rgba(240,82,82,.10); border: 1px solid rgba(240,82,82,.22); color: #f05252;",
+    "error": "background: rgba(240,82,82,.10); border: 1px solid rgba(240,82,82,.22); color: #f05252;",
+}
+
+
+class StartupCheckWorker(QThread):
+    """Runs connectivity checks concurrently and emits per-service results."""
+
+    service_result = pyqtSignal(str, str, str)
+    all_done = pyqtSignal()
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._results: dict[str, tuple[str, str]] = {}
+        self._lock = threading.Lock()
+
+    @property
+    def results(self) -> dict[str, tuple[str, str]]:
+        return dict(self._results)
+
+    def run(self):
+        checks: list[tuple[str, Callable[[], tuple[str, str]]]] = [
+            ("tailscale", self._check_tailscale),
+            ("kde", self._check_kde),
+            ("syncthing", self._check_syncthing),
+            ("bluetooth", self._check_bluetooth),
+        ]
+
+        threads: list[threading.Thread] = []
+        for name, fn in checks:
+            t = threading.Thread(target=self._run_check, args=(name, fn), daemon=True)
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            t.join()
+
+        self.all_done.emit()
+
+    def _run_check(self, name: str, fn: Callable[[], tuple[str, str]]):
         try:
-            r = subprocess.run(
+            status, detail = fn()
+        except Exception:
+            status, detail = "error", "Error"
+        with self._lock:
+            self._results[name] = (status, detail)
+        self.service_result.emit(name, status, detail)
+
+    def _check_tailscale(self) -> tuple[str, str]:
+        try:
+            result = subprocess.run(
                 ["tailscale", "status", "--json"],
                 capture_output=True,
                 text=True,
-                timeout=6,
+                timeout=5,
             )
-            if r.returncode != 0:
-                return {"ok": False, "detail": "tailscale daemon offline"}
-            payload = json.loads(r.stdout or "{}")
-            backend_state = payload.get("BackendState")
-            ip = ((payload.get("Self") or {}).get("TailscaleIPs") or [None])[0]
-            peers = len((payload.get("Peer") or {}).values())
-            ok = backend_state == "Running" and bool(ip)
-            detail = f"{ip} · {peers} peers" if ok else f"state: {backend_state or 'unknown'}"
-            return {"ok": ok, "detail": detail}
-        except Exception as e:
-            return {"ok": False, "detail": f"error: {type(e).__name__}"}
+            if result.returncode != 0:
+                return "offline", "Daemon offline"
+            data = json.loads(result.stdout or "{}")
+            backend_state = str(data.get("BackendState") or "")
+            if backend_state == "Starting":
+                return "starting", "Starting"
+            if backend_state == "Running":
+                return "online", "Online"
+            return "offline", backend_state or "Offline"
+        except Exception:
+            return "error", "Error"
 
-    def check_kde_connect(self):
+    def _check_kde(self) -> tuple[str, str]:
+        if not bool(settings.get("kde_integration_enabled", True)):
+            return "offline", "Disabled"
         try:
-            import dbus
+            import dbus  # type: ignore
 
             bus = dbus.SessionBus()
             obj = bus.get_object("org.kde.kdeconnect", "/modules/kdeconnect")
             iface = dbus.Interface(obj, "org.kde.kdeconnect.daemon")
             devices = iface.devices(True, True)
-            ok = len(devices) > 0 and bool(settings.get("kde_integration_enabled", True))
-            detail = f"{len(devices)} reachable device(s)" if ok else "no reachable paired device"
-            if not settings.get("kde_integration_enabled", True):
-                detail = "disabled in app settings"
-            return {"ok": ok, "detail": detail}
-        except Exception as e:
-            return {"ok": False, "detail": f"error: {type(e).__name__}"}
+            return ("online", "Reachable") if devices else ("offline", "No paired reachable device")
+        except Exception:
+            return "offline", "Offline"
 
-    def check_syncthing(self):
+    def _check_syncthing(self) -> tuple[str, str]:
         try:
-            r = httpx.get(
+            resp = httpx.get(
                 "http://127.0.0.1:8384/rest/system/ping",
                 headers={"X-API-Key": API_KEY},
                 timeout=3,
             )
-            ok = r.status_code == 200
-            detail = "REST API reachable" if ok else f"HTTP {r.status_code}"
-            return {"ok": ok, "detail": detail}
-        except Exception as e:
-            return {"ok": False, "detail": f"error: {type(e).__name__}"}
+            if resp.status_code == 200:
+                return "online", "Online"
+            if resp.status_code in {401, 403}:
+                return "error", "API key rejected"
+            return "starting", f"HTTP {resp.status_code}"
+        except httpx.ConnectError:
+            return "offline", "Offline"
+        except Exception:
+            return "error", "Error"
 
-    def check_adb(self):
-        target = settings.get("adb_target", "100.127.0.90:5555")
+    def _check_bluetooth(self) -> tuple[str, str]:
         try:
-            r = subprocess.run(
-                ["adb", "-s", target, "get-state"],
+            result = subprocess.run(
+                ["bluetoothctl", "show"],
                 capture_output=True,
                 text=True,
-                timeout=4,
+                timeout=3,
             )
-            ok = r.returncode == 0 and "device" in (r.stdout or "")
-            detail = f"{target} reachable" if ok else f"{target} not reachable"
-            return {"ok": ok, "detail": detail}
-        except Exception as e:
-            return {"ok": False, "detail": f"error: {type(e).__name__}"}
-
-    def run_all(self):
-        tailscale = self.check_tailscale()
-        kde = self.check_kde_connect()
-        syncthing = self.check_syncthing()
-        adb = self.check_adb()
-
-        checks = [
-            {"icon": "🔗", "label": "Tailscale Mesh", **tailscale},
-            {"icon": "📱", "label": "KDE Connect", **kde},
-            {"icon": "↺", "label": "Syncthing", **syncthing},
-            {"icon": "⌁", "label": "ADB Link", **adb},
-        ]
-        all_ok = all(c.get("ok") for c in checks[:3])
-        return {
-            "checks": checks,
-            "all_ok": all_ok,
-        }
+            if result.returncode != 0:
+                return "offline", "Offline"
+            text = (result.stdout or "")
+            return ("online", "Online") if "Powered: yes" in text else ("offline", "Disabled")
+        except Exception:
+            return "offline", "Offline"
 
 
-class StartupPopout(QDialog):
-    def __init__(self, results, main_window=None):
-        super().__init__()
-        self.main_window = main_window
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
+class ServiceChip(QWidget):
+    """One row in the startup connectivity popup."""
+
+    def __init__(self, icon: str, label: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setFixedHeight(44)
+        self.setStyleSheet(
+            "QWidget { background:#1a1e28; border:1px solid #252b3b; border-radius:8px; }"
         )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self._build(results)
-        self._position()
 
-    def _build(self, payload):
-        checks = list((payload or {}).get("checks", []) or [])
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(11, 9, 11, 9)
+        row.setSpacing(9)
 
-        frame = QFrame()
-        frame.setStyleSheet(
+        self.icon = QLabel(icon)
+        self.icon.setFixedWidth(15)
+        self.icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.icon.setStyleSheet("color:#94a3b8;font-size:14px;border:none;background:transparent;")
+
+        self.name = QLabel(label)
+        self.name.setStyleSheet("color:#dde3f0;font-size:12px;font-weight:500;border:none;background:transparent;")
+
+        self.pill = QLabel("Checking…")
+        self.pill.setStyleSheet(
+            "font-size:10px;font-family:monospace;padding:2px 8px;border-radius:9px;" + PILL_STYLES["checking"]
+        )
+
+        row.addWidget(self.icon)
+        row.addWidget(self.name, 1)
+        row.addWidget(self.pill)
+
+    def set_status(self, status: str, detail: str = ""):
+        key = status if status in PILL_STYLES else "error"
+        label_map = {
+            "checking": "Checking…",
+            "online": "Online",
+            "starting": "Starting…",
+            "offline": "Offline",
+            "error": "Error",
+        }
+        text = label_map.get(key, "Error")
+        if detail and key in {"offline", "error", "starting"}:
+            text = detail
+        self.pill.setText(text)
+        self.pill.setStyleSheet(
+            "font-size:10px;font-family:monospace;padding:2px 8px;border-radius:9px;" + PILL_STYLES[key]
+        )
+
+
+class StartupCheckPopup(QWidget):
+    """Reusable frameless popup showing startup connectivity status."""
+
+    def __init__(self, main_window=None):
+        super().__init__(None)
+        self.main_window = main_window
+
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+        self._worker: StartupCheckWorker | None = None
+        self._user_interacted = False
+        self._chip_anims: list[QPropertyAnimation] = []
+
+        self._opacity = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self._opacity)
+        self._opacity.setOpacity(0.0)
+
+        self._auto_hide = QTimer(self)
+        self._auto_hide.setSingleShot(True)
+        self._auto_hide.timeout.connect(self._auto_close_if_idle)
+        self._close_on_mouse_leave = False
+        self._hover_close = QTimer(self)
+        self._hover_close.setSingleShot(True)
+        self._hover_close.timeout.connect(self.hide_popup)
+
+        self._build()
+        self.hide()
+
+    def set_main_window(self, window):
+        self.main_window = window
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        card = QFrame()
+        card.setStyleSheet(
             """
             QFrame {
-                background: rgba(7,12,23,246);
-                border: 1px solid rgba(62,240,176,0.28);
-                border-radius: 16px;
+                background:#13161d;
+                border:1px solid #252b3b;
+                border-radius:12px;
             }
-        """
-        )
-        frame.setMinimumWidth(360)
-        fl = QVBoxLayout(frame)
-        fl.setSpacing(10)
-        fl.setContentsMargins(18, 14, 18, 14)
-
-        hrow = QHBoxLayout()
-        title = QLabel("⌘  PhoneBridge")
-        title.setStyleSheet("color:white;font-size:14px;font-weight:600;background:transparent;border:none;")
-        close = QPushButton("✕")
-        close.setFixedSize(20, 20)
-        close.setStyleSheet("background:transparent;color:rgba(255,255,255,0.35);border:none;font-size:13px;")
-        close.clicked.connect(self.close)
-        hrow.addWidget(title)
-        hrow.addStretch()
-        hrow.addWidget(close)
-        fl.addLayout(hrow)
-
-        sub = QLabel("Startup connectivity checks")
-        sub.setStyleSheet(
-            "color:rgba(255,255,255,0.35);font-size:10px;font-family:monospace;background:transparent;border:none;"
-        )
-        fl.addWidget(sub)
-
-        for check in checks:
-            row = QHBoxLayout()
-            row.setSpacing(8)
-            row.addWidget(self._lbl(check.get("icon", "•"), 14))
-            info = QVBoxLayout()
-            info.setSpacing(1)
-            info.addWidget(self._lbl(check.get("label", "Service"), 12, "rgba(255,255,255,0.85)"))
-            info.addWidget(self._lbl(check.get("detail", ""), 10, "rgba(255,255,255,0.45)", mono=True))
-            row.addLayout(info)
-            row.addStretch()
-
-            ok = bool(check.get("ok"))
-            chip_color = "#3ef0b0" if ok else "#f472b6"
-            chip = QLabel("● online" if ok else "● offline")
-            chip.setStyleSheet(
-                f"""
-                color:{chip_color};
-                background:{chip_color}18;
-                border:1px solid {chip_color}55;
-                border-radius:9px;
-                padding:2px 8px;
-                font-size:10px;
-                font-family:monospace;
             """
-            )
-            row.addWidget(chip)
-            fl.addLayout(row)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color:rgba(255,255,255,0.07);background:rgba(255,255,255,0.07);max-height:1px;")
-        fl.addWidget(sep)
-
-        brow = QHBoxLayout()
-        brow.setSpacing(8)
-        for txt, style, hover, cb in [
-            ("Dismiss", "rgba(255,255,255,0.05)", "rgba(255,255,255,0.1)", self.close),
-            ("Open App", "rgba(62,240,176,0.12)", "rgba(62,240,176,0.22)", self._open),
-        ]:
-            btn = QPushButton(txt)
-            is_open = txt == "Open App"
-            color = "#3ef0b0" if is_open else "rgba(255,255,255,0.6)"
-            border = "rgba(62,240,176,0.30)" if is_open else "rgba(255,255,255,0.12)"
-            btn.setStyleSheet(
-                f"""
-                QPushButton {{
-                    background:{style};border:1px solid {border};
-                    border-radius:8px;color:{color};
-                    padding:7px 14px;font-size:12px;
-                }}
-                QPushButton:hover {{ background:{hover}; }}
-            """
-            )
-            btn.clicked.connect(cb)
-            brow.addWidget(btn)
-        fl.addLayout(brow)
-
-        layout.addWidget(frame)
-
-    def _lbl(self, text, size=12, color="rgba(255,255,255,0.88)", bold=False, mono=False):
-        l = QLabel(text)
-        l.setStyleSheet(
-            f"""
-            color:{color};font-size:{size}px;
-            font-weight:{'600' if bold else '400'};
-            font-family:{'monospace' if mono else 'sans-serif'};
-            background:transparent;border:none;
-        """
         )
-        return l
+        root.addWidget(card)
 
-    def _open(self):
-        if self.main_window:
-            self.main_window.show_and_raise()
-        self.close()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-    def _position(self):
+        header = QVBoxLayout()
+        header.setContentsMargins(15, 15, 15, 10)
+        header.setSpacing(2)
+        title = QLabel("Connectivity Check")
+        title.setStyleSheet("color:#dde3f0;font-size:14px;font-weight:700;border:none;background:transparent;")
+        sub = QLabel("PhoneBridge startup status")
+        sub.setStyleSheet("color:#4e5a72;font-size:11px;border:none;background:transparent;")
+        header.addWidget(title)
+        header.addWidget(sub)
+        layout.addLayout(header)
+
+        chips_wrap = QVBoxLayout()
+        chips_wrap.setContentsMargins(13, 0, 13, 13)
+        chips_wrap.setSpacing(5)
+        self.chips = {
+            "tailscale": ServiceChip("🔒", "Tailscale"),
+            "kde": ServiceChip("⛓", "KDE Connect"),
+            "syncthing": ServiceChip("↺", "Syncthing"),
+            "bluetooth": ServiceChip("⌬", "Bluetooth"),
+        }
+        for key in ("tailscale", "kde", "syncthing", "bluetooth"):
+            chips_wrap.addWidget(self.chips[key])
+        layout.addLayout(chips_wrap)
+
+        actions = QHBoxLayout()
+        actions.setContentsMargins(13, 0, 13, 13)
+        actions.setSpacing(7)
+
+        self.open_btn = QPushButton("Open App")
+        self.open_btn.setStyleSheet(
+            """
+            QPushButton {
+                background:#4f8ef7;
+                color:white;
+                border:none;
+                border-radius:8px;
+                min-height:34px;
+                font-size:12px;
+                font-weight:600;
+            }
+            QPushButton:disabled {
+                background:rgba(79,142,247,0.45);
+                color:rgba(255,255,255,0.75);
+            }
+            """
+        )
+        self.open_btn.clicked.connect(self._open_app)
+
+        self.dismiss_btn = QPushButton("Dismiss")
+        self.dismiss_btn.setStyleSheet(
+            """
+            QPushButton {
+                background:#1a1e28;
+                color:#94a3b8;
+                border:1px solid #252b3b;
+                border-radius:8px;
+                min-height:34px;
+                font-size:12px;
+                font-weight:500;
+            }
+            """
+        )
+        self.dismiss_btn.clicked.connect(self.hide_popup)
+
+        actions.addWidget(self.open_btn, 1)
+        actions.addWidget(self.dismiss_btn, 1)
+        layout.addLayout(actions)
+
+        self.setFixedWidth(350)
+
+    def _position(self, mode: str, anchor_pos=None):
         from PyQt6.QtWidgets import QApplication
 
         self.adjustSize()
-        geo = QApplication.primaryScreen().availableGeometry()
-        self.move(geo.right() - self.width() - 24, geo.bottom() - self.height() - 24)
+        screen = QApplication.primaryScreen().availableGeometry()
+        if anchor_pos is not None:
+            x = int(anchor_pos.x() - self.width() + 18)
+            y = int(anchor_pos.y() - self.height() - 8)
+            x = max(screen.x() + 8, min(x, screen.right() - self.width() - 8))
+            y = max(screen.y() + 8, min(y, screen.bottom() - self.height() - 8))
+            self.move(x, y)
+            return
+        if mode == "window" and self.main_window and self.main_window.isVisible():
+            geo = self.main_window.geometry()
+            x = geo.x() + (geo.width() - self.width()) // 2
+            y = geo.y() + max(20, (geo.height() - self.height()) // 3)
+            self.move(x, y)
+            return
+        if mode == "tray":
+            x = screen.right() - self.width() - 24
+            y = screen.bottom() - self.height() - 24
+            self.move(x, y)
+            return
+        x = screen.x() + (screen.width() - self.width()) // 2
+        y = screen.y() + screen.height() // 3
+        self.move(x, y)
+
+    def show_and_run(
+        self,
+        *,
+        mode: str,
+        auto_hide_ms: int | None = None,
+        anchor_pos=None,
+        close_on_mouse_leave: bool = False,
+    ):
+        self._user_interacted = False
+        self._close_on_mouse_leave = bool(close_on_mouse_leave)
+        self._hover_close.stop()
+        for chip in self.chips.values():
+            chip.set_status("checking")
+
+        if self._worker is not None:
+            try:
+                self._worker.quit()
+                self._worker.wait(100)
+            except Exception:
+                pass
+            self._worker = None
+
+        self._position(mode, anchor_pos=anchor_pos)
+
+        self._opacity.setOpacity(0.0)
+        self.show()
+        self.raise_()
+        self._animate_chip_intro()
+
+        fade = QPropertyAnimation(self._opacity, b"opacity", self)
+        fade.setDuration(200)
+        fade.setStartValue(0.0)
+        fade.setEndValue(1.0)
+        fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        fade.start()
+        self._fade_in_anim = fade
+
+        self._worker = StartupCheckWorker(self)
+        self._worker.service_result.connect(self._on_service_result)
+        self._worker.all_done.connect(self._on_all_done)
+        self._worker.start()
+
+        if auto_hide_ms and auto_hide_ms > 0:
+            self._auto_hide.start(int(auto_hide_ms))
+        else:
+            self._auto_hide.stop()
+
+    def enterEvent(self, event):
+        self._hover_close.stop()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self._close_on_mouse_leave:
+            self._hover_close.start(420)
+        super().leaveEvent(event)
+
+    def _animate_chip_intro(self):
+        self._chip_anims.clear()
+        order = ("tailscale", "kde", "syncthing", "bluetooth")
+        for idx, key in enumerate(order):
+            chip = self.chips.get(key)
+            if chip is None:
+                continue
+            effect = chip.graphicsEffect()
+            if not isinstance(effect, QGraphicsOpacityEffect):
+                effect = QGraphicsOpacityEffect(chip)
+                chip.setGraphicsEffect(effect)
+            effect.setOpacity(0.0)
+
+            def _start_anim(target_effect=effect):
+                anim = QPropertyAnimation(target_effect, b"opacity", self)
+                anim.setDuration(200)
+                anim.setStartValue(0.0)
+                anim.setEndValue(1.0)
+                anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+                anim.start()
+                self._chip_anims.append(anim)
+
+            QTimer.singleShot(idx * 50, _start_anim)
+
+    def _on_service_result(self, service: str, status: str, detail: str):
+        chip = self.chips.get(str(service))
+        if chip is not None:
+            chip.set_status(status, detail)
+
+    def _on_all_done(self):
+        self.open_btn.setEnabled(True)
+        self.open_btn.setText("Open App")
+
+    def _auto_close_if_idle(self):
+        if not self._user_interacted:
+            self.hide_popup()
+
+    def _open_app(self):
+        self._user_interacted = True
+        if self.main_window is not None and hasattr(self.main_window, "show_and_raise"):
+            self.main_window.show_and_raise()
+        self.hide_popup()
+
+    def hide_popup(self):
+        self._user_interacted = True
+        self._auto_hide.stop()
+        self._hover_close.stop()
+        if not self.isVisible():
+            return
+        fade = QPropertyAnimation(self._opacity, b"opacity", self)
+        fade.setDuration(180)
+        fade.setStartValue(self._opacity.opacity())
+        fade.setEndValue(0.0)
+        fade.setEasingCurve(QEasingCurve.Type.InCubic)
+        fade.finished.connect(self.hide)
+        fade.start()
+        self._fade_out_anim = fade
 
 
 class StartupChecker:
+    """Facade used by main/window to show or rerun startup checks."""
+
+    _popup: StartupCheckPopup | None = None
+
     def __init__(self, main_window=None):
         self.main_window = main_window
 
-    def run_and_show(self):
-        results = ConnectivityChecker().run_all()
-        popout = StartupPopout(results, self.main_window)
-        popout.show()
-        if results.get("all_ok"):
-            QTimer.singleShot(8000, popout.close)
+    def _get_popup(self) -> StartupCheckPopup:
+        if StartupChecker._popup is None:
+            StartupChecker._popup = StartupCheckPopup(self.main_window)
+        StartupChecker._popup.set_main_window(self.main_window)
+        return StartupChecker._popup
+
+    def run_and_show(
+        self,
+        *,
+        from_tray: bool = False,
+        background_mode: bool = False,
+        anchor_pos=None,
+        close_on_mouse_leave: bool = False,
+    ):
+        popup = self._get_popup()
+        if from_tray:
+            mode = "tray"
+            auto_hide_ms = None
+        elif self.main_window is not None and self.main_window.isVisible() and not background_mode:
+            mode = "window"
+            auto_hide_ms = None
+        else:
+            mode = "screen"
+            auto_hide_ms = 10000 if background_mode else None
+        popup.show_and_run(
+            mode=mode,
+            auto_hide_ms=auto_hide_ms,
+            anchor_pos=anchor_pos,
+            close_on_mouse_leave=close_on_mouse_leave,
+        )

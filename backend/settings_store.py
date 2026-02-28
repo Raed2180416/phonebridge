@@ -19,11 +19,20 @@ DEFAULTS = {
     "window_opacity":       94,
     "close_to_tray":        True,
     "auto_bt_connect":      True,
+    # Keep phone-call routing stable by dropping BT media profiles when idle.
+    "bt_call_ready_mode":   True,
+    "sync_on_mobile_data":  False,
     "theme_variant":        "minimal_glass",
     "theme_name":           "slate",
     "surface_alpha_mode":   "auto_fallback",
-    "motion_level":         "rich",
+    "motion_level":         "subtle",
     "kde_integration_enabled": True,
+    "startup_check_on_login": True,
+    "call_output_device":   "",
+    "call_input_device":    "",
+    "call_output_volume_pct": -1,
+    "call_input_volume_pct": -1,
+    "tailscale_force_off":  False,
 }
 
 _cache = None

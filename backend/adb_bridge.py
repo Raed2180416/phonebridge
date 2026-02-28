@@ -3,6 +3,7 @@ import subprocess
 import os
 import logging
 import time
+import re
 
 PHONE_TARGET = "100.127.0.90:5555"
 log = logging.getLogger(__name__)
@@ -12,10 +13,16 @@ class ADBBridge:
         self.target = target
         self._screenrecord_proc = None
         self._screenrecord_remote_path = ""
+        self._screenrecord_target = ""
         self._last_state = {"wifi": None, "bluetooth": None, "dnd": None}
+        self._cached_devices = []
+        self._cached_devices_at = 0.0
+        self._last_connect_attempt_at = 0.0
+        self._last_tcpip_enable_at = 0.0
+        self._active_target = target
 
-    def _run(self, *args, timeout=8):
-        cmd = ["adb", "-s", self.target] + list(args)
+    def _run_adb(self, *args, timeout=8):
+        cmd = ["adb", *args]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
             if r.returncode != 0:
@@ -28,8 +35,163 @@ class ADBBridge:
             log.warning("ADB command error: %s :: %s", " ".join(cmd), e)
             return False, str(e)
 
+    @staticmethod
+    def _parse_adb_devices(text: str):
+        devices = []
+        for raw in (text or "").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("List of devices attached"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            serial = parts[0].strip()
+            state = parts[1].strip()
+            tail = " ".join(parts[2:])
+            is_tcp = ":" in serial
+            transport = "wireless" if is_tcp else "usb"
+            if "usb:" in tail:
+                transport = "usb"
+            devices.append({
+                "serial": serial,
+                "state": state,
+                "transport": transport,
+                "tail": tail,
+            })
+        return devices
+
+    def _get_devices(self, force=False):
+        now = time.monotonic()
+        if (not force) and self._cached_devices and (now - self._cached_devices_at) < 1.0:
+            return self._cached_devices
+        ok, out = self._run_adb("devices", "-l", timeout=4)
+        devices = self._parse_adb_devices(out if ok else "")
+        self._cached_devices = devices
+        self._cached_devices_at = now
+        return devices
+
+    def _configured_wireless_target(self):
+        return self.target if ":" in str(self.target or "") else ""
+
+    def _wireless_target_port(self) -> int:
+        target = str(self._configured_wireless_target() or "")
+        if ":" not in target:
+            return 5555
+        try:
+            return int(target.rsplit(":", 1)[1].strip())
+        except Exception:
+            return 5555
+
+    def _ensure_wireless_keepalive_from_usb(self, usb_serial: str) -> None:
+        """When USB is present, keep tcpip debugging available in parallel."""
+        target = self._configured_wireless_target()
+        if (not target) or (not usb_serial):
+            return
+        devices = self._get_devices(force=False)
+        for dev in devices:
+            if str(dev.get("serial")) == target and str(dev.get("state")) == "device":
+                return
+        now = time.monotonic()
+        # Throttle to avoid spamming `adb tcpip` while UI polling is active.
+        if (now - self._last_tcpip_enable_at) < 600.0:
+            return
+        self._last_tcpip_enable_at = now
+        port = str(self._wireless_target_port())
+        ok_tcp, out_tcp = self._run_adb("-s", usb_serial, "tcpip", port, timeout=7)
+        if not ok_tcp:
+            log.warning(
+                "Failed enabling adb tcpip via USB serial=%s port=%s :: %s",
+                usb_serial,
+                port,
+                (out_tcp or "").strip(),
+            )
+            return
+        ok_conn, out_conn = self._run_adb("connect", target, timeout=7)
+        if ok_conn or ("connected" in (out_conn or "").lower()) or ("already connected" in (out_conn or "").lower()):
+            self._get_devices(force=True)
+            log.info("Ensured dual ADB transport (usb preferred, wireless ready): usb=%s wireless=%s", usb_serial, target)
+
+    def _pick_connected_target(self, devices):
+        connected = [d for d in devices if d.get("state") == "device"]
+        usb = [d for d in connected if d.get("transport") == "usb"]
+        if usb:
+            return usb[0]["serial"], "usb"
+
+        preferred = self._configured_wireless_target()
+        if preferred:
+            for dev in connected:
+                if dev.get("serial") == preferred:
+                    return preferred, "wireless"
+
+        wireless = [d for d in connected if d.get("transport") == "wireless"]
+        if wireless:
+            return wireless[0]["serial"], "wireless"
+        return None, None
+
+    def _connect_wireless(self):
+        target = self._configured_wireless_target()
+        if not target:
+            return False
+        now = time.monotonic()
+        if (now - self._last_connect_attempt_at) < 4.0:
+            return False
+        self._last_connect_attempt_at = now
+        ok, out = self._run_adb("connect", target, timeout=7)
+        msg = (out or "").lower()
+        hinted_ok = bool(ok or ("connected" in msg) or ("already connected" in msg))
+        if hinted_ok:
+            # `adb connect` can report "already connected" while no usable device row exists.
+            # Validate by re-reading adb device table and requiring an actual `device` state.
+            devices = self._get_devices(force=True)
+            for dev in devices:
+                if str(dev.get("serial")) == target and str(dev.get("state")) == "device":
+                    log.info("ADB wireless connect ready target=%s", target)
+                    return True
+            log.warning(
+                "ADB wireless connect reported success but target is not usable: target=%s state_rows=%s",
+                target,
+                [f"{d.get('serial')}:{d.get('state')}" for d in devices],
+            )
+        return False
+
+    def _resolve_target(self, allow_connect=True):
+        devices = self._get_devices(force=False)
+        serial, transport = self._pick_connected_target(devices)
+        if serial:
+            if transport == "usb":
+                self._ensure_wireless_keepalive_from_usb(serial)
+            self._active_target = serial
+            return serial
+
+        if allow_connect and self._connect_wireless():
+            devices = self._get_devices(force=True)
+            serial, transport = self._pick_connected_target(devices)
+            if serial:
+                if transport == "usb":
+                    self._ensure_wireless_keepalive_from_usb(serial)
+                self._active_target = serial
+                return serial
+
+        # Last chance: force-refresh devices and accept any connected USB/wireless target.
+        devices = self._get_devices(force=True)
+        serial, transport = self._pick_connected_target(devices)
+        if serial:
+            if transport == "usb":
+                self._ensure_wireless_keepalive_from_usb(serial)
+            self._active_target = serial
+            return serial
+
+        return None
+
+    def _run(self, *args, timeout=8):
+        serial = self._resolve_target(allow_connect=True)
+        if not serial:
+            log.warning("ADB command skipped (no connected target): adb %s", " ".join(args))
+            return False, "no adb target connected"
+        return self._run_adb("-s", serial, *args, timeout=timeout)
+
     def is_connected(self):
-        ok, out = self._run("get-state")
+        ok, out = self._run("get-state", timeout=2)
         return ok and "device" in out
 
     def launch_scrcpy(self, mode="mirror", extra_args=None, env_overrides=None):
@@ -39,16 +201,30 @@ class ADBBridge:
         if env_overrides:
             env.update(env_overrides)
 
+        # Higher-quality, more resilient audio defaults for network ADB links.
+        audio_quality_flags = [
+            "--audio-codec=aac",
+            "--audio-bit-rate=256K",
+            "--audio-buffer=120",
+            "--audio-output-buffer=10",
+        ]
+
+        serial = self._resolve_target(allow_connect=True)
+        if not serial:
+            log.warning("Failed to launch scrcpy mode=%s: no adb target connected", mode)
+            return None
+
         cmds = {
             "mirror": [
-                "scrcpy", "--serial", self.target,
+                "scrcpy", "--serial", serial,
                 "--video-bit-rate", "8M",
                 "--audio-source", "output",
                 "--max-size", "1920",
                 "--render-driver", "opengl",
+                *audio_quality_flags,
             ],
             "webcam": [
-                "scrcpy", "--serial", self.target,
+                "scrcpy", "--serial", serial,
                 "--video-source=camera",
                 "--camera-facing=front",
                 "--camera-size=1280x720",
@@ -56,21 +232,24 @@ class ADBBridge:
                 "--render-driver", "opengl",
             ],
             "audio": [
-                "scrcpy", "--serial", self.target,
+                "scrcpy", "--serial", serial,
                 "--audio-source=voice-call",
                 "--no-video",
+                "--no-window",
             ],
             "audio_output": [
                 # Route ALL phone audio to PC speakers
-                "scrcpy", "--serial", self.target,
+                "scrcpy", "--serial", serial,
                 "--audio-source=output",
                 "--no-video",
+                "--no-window",
+                *audio_quality_flags,
             ],
         }
         cmd = list(cmds.get(mode, cmds["mirror"]))
         if extra_args:
             cmd.extend(list(extra_args))
-        log.info("Launching scrcpy mode=%s target=%s", mode, self.target)
+        log.info("Launching scrcpy mode=%s target=%s", mode, serial)
         try:
             proc = subprocess.Popen(cmd, env=env)
             return proc
@@ -125,7 +304,7 @@ class ADBBridge:
         return ok
 
     def get_wifi_enabled(self):
-        ok, out = self._run("shell", "cmd", "wifi", "status")
+        ok, out = self._run("shell", "cmd", "wifi", "status", timeout=3)
         if not ok:
             return self._last_state.get("wifi")
         text = (out or "").lower()
@@ -137,24 +316,89 @@ class ADBBridge:
             return False
         return self._last_state.get("wifi")
 
+    def get_active_network_hint(self):
+        """Best-effort network type hint from Android when KDE network type is unavailable."""
+        ok, out = self._run("shell", "dumpsys", "connectivity", timeout=4)
+        if ok:
+            text = (out or "").lower()
+            if "transport: cellular" in text or "type: mobile" in text:
+                return "mobile"
+            if "transport: wifi" in text or "type: wifi" in text:
+                return "wifi"
+        ok, out = self._run("shell", "dumpsys", "telephony.registry", timeout=4)
+        if ok:
+            text = (out or "").lower()
+            if "nrstate=connected" in text or "mdataregstate=0" in text:
+                return "mobile"
+        return ""
+
     def set_bluetooth(self, enabled: bool):
-        args = ("shell", "svc", "bluetooth", "enable" if enabled else "disable")
+        desired = bool(enabled)
+        args = ("shell", "svc", "bluetooth", "enable" if desired else "disable")
         ok, _ = self._run(*args, timeout=15)
+        # Fallback for builds where svc is flaky.
+        if not ok:
+            args2 = ("shell", "cmd", "bluetooth_manager", "enable" if desired else "disable")
+            ok2, _ = self._run(*args2, timeout=15)
+            ok = bool(ok or ok2)
+        # Prime cache from observed state after command.
+        end = time.time() + 3.5
+        while time.time() < end:
+            actual = self.get_bluetooth_enabled()
+            if actual is not None and bool(actual) == desired:
+                break
+            time.sleep(0.25)
         if not ok:
             log.warning("Bluetooth toggle failed enabled=%s", enabled)
         return ok
 
+    @staticmethod
+    def _parse_bt_enabled(text: str):
+        raw = str(text or "")
+        if not raw:
+            return None
+        lines = raw.splitlines()
+        for line in lines:
+            s = line.strip().lower()
+            if s.startswith("enabled:"):
+                if re.search(r"\benabled:\s*true\b", s):
+                    return True
+                if re.search(r"\benabled:\s*false\b", s):
+                    return False
+        for line in lines:
+            s = line.strip().lower()
+            if s.startswith("state:"):
+                state_txt = s.split(":", 1)[1].strip()
+                if state_txt in {"on", "turning_on"}:
+                    return True
+                if state_txt in {"off", "turning_off", "ble_on", "ble_turning_on", "ble_turning_off"}:
+                    return False
+        for line in lines:
+            s = line.strip().lower().replace(" ", "")
+            m = re.match(r"^menable:(true|false)$", s)
+            if m:
+                return m.group(1) == "true"
+        return None
+
     def get_bluetooth_enabled(self):
-        ok, out = self._run("shell", "dumpsys", "bluetooth_manager", timeout=6)
+        ok, out = self._run("shell", "settings", "get", "global", "bluetooth_on", timeout=3)
+        if ok:
+            val = (out or "").strip().splitlines()
+            if val:
+                atom = val[-1].strip().lower()
+                if atom in {"1", "true"}:
+                    self._last_state["bluetooth"] = True
+                    return True
+                if atom in {"0", "false"}:
+                    self._last_state["bluetooth"] = False
+                    return False
+        ok, out = self._run("shell", "dumpsys", "bluetooth_manager", timeout=4)
         if not ok:
             return self._last_state.get("bluetooth")
-        text = (out or "").lower()
-        if "enabled: true" in text or "state: on" in text:
-            self._last_state["bluetooth"] = True
-            return True
-        if "enabled: false" in text or "state: off" in text:
-            self._last_state["bluetooth"] = False
-            return False
+        parsed = self._parse_bt_enabled(out or "")
+        if parsed is not None:
+            self._last_state["bluetooth"] = bool(parsed)
+            return bool(parsed)
         return self._last_state.get("bluetooth")
 
     def get_contacts(self, limit=300):
@@ -224,27 +468,35 @@ class ADBBridge:
             current = 0
         nxt = (current + 1) % 4
         # Preferred path on modern Android builds.
+        self._run("shell", "cmd", "window", "user-rotation", "free", timeout=3)
         ok1, _ = self._run("shell", "cmd", "window", "user-rotation", "lock", str(nxt), timeout=4)
         # Legacy fallback.
         ok2, _ = self._run("shell", "settings", "put", "system", "accelerometer_rotation", "0", timeout=4)
         ok3, _ = self._run("shell", "settings", "put", "system", "user_rotation", str(nxt), timeout=4)
         ok4, _ = self._run("shell", "wm", "user-rotation", "lock", str(nxt), timeout=4)
-        return bool(ok1 or (ok2 and ok3) or ok4)
+        ok5, _ = self._run("shell", "cmd", "display", "set-user-rotation", "lock", str(nxt), timeout=4)
+        return bool(ok1 or (ok2 and ok3) or ok4 or ok5)
 
     def get_display_rotation(self):
         ok, out = self._run("shell", "dumpsys", "display", timeout=10)
         if not ok:
             return None
         import re
+        m0 = re.search(r"mUserRotation=(\d+)", out or "")
+        if m0:
+            return int(m0.group(1))
         m = re.search(r"mCurrentOrientation=(\d+)", out or "")
         if m:
             return int(m.group(1))
         m2 = re.search(r"mOverrideDisplayInfo=.*?\brotation (\d)\b", out or "", re.DOTALL)
         if m2:
             return int(m2.group(1))
+        m3 = re.search(r"SurfaceOrientation:\s*(\d+)", out or "")
+        if m3:
+            return int(m3.group(1))
         return None
 
-    def get_now_playing(self):
+    def get_now_playing(self, preferred_package: str = ""):
         ok, out = self._run("shell", "dumpsys", "media_session", timeout=4)
         if not ok:
             return None
@@ -288,10 +540,20 @@ class ADBBridge:
             sessions.append(current)
         if not sessions:
             return None
-        active = [s for s in sessions if s.get("active")]
-        chosen = active[0] if active else sessions[0]
+        preferred = (preferred_package or "").strip()
+        chosen = None
+        if preferred:
+            for session in sessions:
+                if str(session.get("package") or "").strip() == preferred:
+                    chosen = session
+                    break
+        if chosen is None:
+            active = [s for s in sessions if s.get("active")]
+            chosen = active[0] if active else sessions[0]
         if not chosen.get("title") and not chosen.get("package"):
             return None
+        chosen = dict(chosen)
+        chosen["sessions"] = sessions
         return chosen
 
     def media_play_pause(self):
@@ -311,13 +573,37 @@ class ADBBridge:
             return False
         return self._run("shell", "am", "force-stop", package_name)[0]
 
+    def launch_app(self, package_name: str):
+        pkg = str(package_name or "").strip()
+        if not pkg:
+            return False
+        ok, out = self._run(
+            "shell",
+            "monkey",
+            "-p",
+            pkg,
+            "-c",
+            "android.intent.category.LAUNCHER",
+            "1",
+            timeout=5,
+        )
+        text = (out or "").lower()
+        return bool(ok and ("events injected: 1" in text or "monkey finished" in text))
+
     def toggle_dnd(self, enable: bool):
-        mode = "on" if enable else "off"
-        ok, out = self._run("shell", "cmd", "notification", "set_dnd", mode, timeout=4)
-        if ok and "invalid" not in (out or "").lower():
-            return True
-        ok2, _ = self._run("shell", "settings", "put", "global", "zen_mode", "1" if enable else "0", timeout=4)
-        return ok2
+        # Prefer "priority" mode to avoid Android's full-audio mute behavior from "none/on".
+        if enable:
+            modes = ("priority", "on")
+        else:
+            modes = ("off", "all")
+        for mode in modes:
+            ok, out = self._run("shell", "cmd", "notification", "set_dnd", mode, timeout=4)
+            if ok and "invalid" not in (out or "").lower():
+                if not enable:
+                    # Best-effort restore of call stream mute state after exiting DND.
+                    self._run("shell", "cmd", "audio", "adj-unmute", "0", timeout=4)
+                return True
+        return False
 
     def get_dnd_enabled(self):
         ok, out = self._run("shell", "settings", "get", "global", "zen_mode", timeout=4)
@@ -326,6 +612,10 @@ class ADBBridge:
         text = (out or "").strip()
         if text.isdigit():
             self._last_state["dnd"] = int(text) != 0
+            return self._last_state["dnd"]
+        lowered = text.lower()
+        if lowered in {"off", "all", "none", "priority", "alarms", "on"}:
+            self._last_state["dnd"] = lowered not in {"off", "all"}
             return self._last_state["dnd"]
         return self._last_state.get("dnd")
 
@@ -341,7 +631,46 @@ class ADBBridge:
         ok, _ = self._run("shell", "input", "keyevent", "KEYCODE_ENDCALL", timeout=4)
         return ok
 
+    def get_call_state(self) -> str:
+        """Return telephony call state: idle | ringing | offhook | unknown."""
+        serial = self._resolve_target(allow_connect=True)
+        if not serial:
+            return "unknown"
+        ok, out = self._run_adb("-s", serial, "shell", "dumpsys", "telephony.registry", timeout=5)
+        if not ok:
+            return "unknown"
+        values = []
+        try:
+            for raw in (out or "").splitlines():
+                line = raw.strip()
+                match = re.search(r"\bmCallState\s*=\s*(-?\d+)", line)
+                if not match:
+                    continue
+                values.append(int(match.group(1)))
+        except Exception:
+            return "unknown"
+        if not values:
+            return "unknown"
+        if any(v == 2 for v in values):
+            return "offhook"
+        if any(v == 1 for v in values):
+            return "ringing"
+        if all(v == 0 for v in values):
+            return "idle"
+        return "unknown"
+
+    def _phone_call_active(self):
+        status = self.get_call_state()
+        if status == "unknown":
+            return None
+        return status in {"ringing", "offhook"}
+
     def set_call_muted(self, muted: bool):
+        # Avoid muting command spam when phone is idle; unmute remains allowed as recovery.
+        if muted:
+            active = self._phone_call_active()
+            if active is False:
+                return False
         # STREAM_VOICE_CALL = 0
         telecom_flag = "true" if muted else "false"
         if muted:
@@ -349,20 +678,12 @@ class ADBBridge:
                 ("shell", "cmd", "telecom", "mute", telecom_flag),
                 ("shell", "cmd", "telecom", "set-mute", telecom_flag),
                 ("shell", "cmd", "audio", "adj-mute", "0"),
-                ("shell", "cmd", "audio", "set-volume", "0", "0"),
-                ("shell", "cmd", "audio", "set-stream-volume", "0", "0"),
-                ("shell", "media", "volume", "--stream", "0", "--set", "0"),
-                ("shell", "input", "keyevent", "KEYCODE_VOLUME_MUTE"),
-                ("shell", "input", "keyevent", "KEYCODE_MUTE"),
             ]
         else:
             attempts = [
                 ("shell", "cmd", "telecom", "mute", telecom_flag),
                 ("shell", "cmd", "telecom", "set-mute", telecom_flag),
                 ("shell", "cmd", "audio", "adj-unmute", "0"),
-                ("shell", "media", "volume", "--stream", "0", "--set", "5"),
-                ("shell", "input", "keyevent", "KEYCODE_VOLUME_MUTE"),
-                ("shell", "input", "keyevent", "KEYCODE_MUTE"),
             ]
         for args in attempts:
             ok, _ = self._run(*args, timeout=4)
@@ -373,13 +694,17 @@ class ADBBridge:
     def start_screen_recording(self, local_dir=None):
         if self._screenrecord_proc and self._screenrecord_proc.poll() is None:
             return None
+        serial = self._resolve_target(allow_connect=True)
+        if not serial:
+            return None
         if not local_dir:
             local_dir = os.path.expanduser("~/PhoneSync/PhoneBridgeRecordings")
         os.makedirs(local_dir, exist_ok=True)
         stamp = int(time.time())
         self._screenrecord_remote_path = f"/sdcard/Movies/phonebridge_{stamp}.mp4"
+        self._screenrecord_target = serial
         self._screenrecord_proc = subprocess.Popen(
-            ["adb", "-s", self.target, "shell", "screenrecord", "--time-limit", "180", self._screenrecord_remote_path],
+            ["adb", "-s", serial, "shell", "screenrecord", "--time-limit", "180", self._screenrecord_remote_path],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -406,9 +731,15 @@ class ADBBridge:
         if not self._screenrecord_remote_path:
             return None
         local_path = os.path.join(local_dir, os.path.basename(self._screenrecord_remote_path))
-        ok_pull, _ = self._run("pull", self._screenrecord_remote_path, local_path, timeout=25)
-        self._run("shell", "rm", self._screenrecord_remote_path, timeout=6)
+        serial = self._screenrecord_target or self._resolve_target(allow_connect=True)
+        if not serial:
+            self._screenrecord_remote_path = ""
+            self._screenrecord_target = ""
+            return None
+        ok_pull, _ = self._run_adb("-s", serial, "pull", self._screenrecord_remote_path, local_path, timeout=25)
+        self._run_adb("-s", serial, "shell", "rm", self._screenrecord_remote_path, timeout=6)
         self._screenrecord_remote_path = ""
+        self._screenrecord_target = ""
         if ok_pull and os.path.exists(local_path):
             return local_path
         return None
@@ -427,11 +758,8 @@ class ADBBridge:
 
     def connect_wifi(self):
         """Reconnect ADB over Tailscale"""
-        try:
-            r = subprocess.run(
-                ["adb", "connect", self.target],
-                capture_output=True, text=True, timeout=10
-            )
-            return "connected" in r.stdout or "already" in r.stdout
-        except:
+        if not self._configured_wireless_target():
             return False
+        ok = self._connect_wireless()
+        self._get_devices(force=True)
+        return bool(ok and self._resolve_target(allow_connect=False))

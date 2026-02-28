@@ -1,8 +1,13 @@
 """KDE Connect D-Bus interface — all plugins"""
+import logging
+import os
+import subprocess
+import configparser
+from pathlib import Path
+
 import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
-import logging
 from backend.settings_store import get as setting
 
 DEVICE_ID = "a9fe30c209da40d4bddce484a2c4112a"
@@ -144,14 +149,41 @@ class KDEConnect:
 
     def dismiss_notification(self, notif_id):
         """Dismiss via the per-notification object's dismiss() method"""
+        ok = False
         try:
             npath = self._dev(f"notifications/{notif_id}")
             self._iface(npath,
                         "org.kde.kdeconnect.device.notifications.notification"
                         ).dismiss()
-            return True
+            ok = True
         except Exception as e:
             log.warning("Notification dismiss failed %s: %s", notif_id, e)
+
+        # Some notifications respond only to sendAction() paths.
+        if not ok:
+            for candidate in ("dismiss", "clear", "default"):
+                try:
+                    self._iface(
+                        self._dev("notifications"),
+                        "org.kde.kdeconnect.device.notifications",
+                    ).sendAction(str(notif_id), candidate)
+                    ok = True
+                    break
+                except Exception:
+                    continue
+        return ok
+
+    def open_notification_reply(self, notif_id):
+        """Trigger reply flow for a notification using per-notification reply()."""
+        try:
+            npath = self._dev(f"notifications/{notif_id}")
+            self._iface(
+                npath,
+                "org.kde.kdeconnect.device.notifications.notification",
+            ).reply()
+            return True
+        except Exception as e:
+            log.warning("Notification quick-reply open failed %s: %s", notif_id, e)
             return False
 
     def reply_notification(self, reply_id, message):
@@ -404,6 +436,77 @@ class KDEConnect:
             return str(self._prop("sftp", "org.kde.kdeconnect.device.sftp", "mountPoint") or "")
         except:
             return ""
+
+    def get_receive_path(self):
+        """Best-effort local path used by KDE Connect for received files."""
+        candidates = [
+            os.path.expanduser("~/.config/kdeconnectrc"),
+            os.path.expanduser("~/.config/kdeconnect/kdeconnectrc"),
+        ]
+        for path in candidates:
+            try:
+                if not os.path.exists(path):
+                    continue
+                cfg = configparser.ConfigParser()
+                cfg.read(path, encoding="utf-8")
+                for section in cfg.sections():
+                    lower_section = section.lower()
+                    if "share" not in lower_section and "kdeconnect" not in lower_section:
+                        continue
+                    for key in ("downloadpath", "download_path", "incomingpath", "incoming_path", "savepath"):
+                        if cfg.has_option(section, key):
+                            value = (cfg.get(section, key) or "").strip()
+                            if value:
+                                return os.path.expanduser(value)
+            except Exception:
+                continue
+
+        try:
+            out = subprocess.check_output(["xdg-user-dir", "DOWNLOAD"], text=True, timeout=2).strip()
+            if out:
+                return os.path.expanduser(out)
+        except Exception:
+            pass
+        return os.path.expanduser("~/Downloads")
+
+    @staticmethod
+    def suppress_native_notification_popups(enable: bool = True) -> bool:
+        """
+        Disable KDE Connect's own desktop popup event so only PhoneBridge-mirrored
+        notifications are shown in the shell panel.
+        """
+        target_action = "None" if enable else "Popup"
+        cfg_path = Path.home() / ".config" / "knotifications6" / "kdeconnect.notifyrc"
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # KConfig is case-sensitive for key names in practice; keep exact casing.
+        desired = (
+            "[Event/notification]\n"
+            f"Action={target_action}\n"
+            "ShowInHistory=false\n"
+        )
+        current = ""
+        if cfg_path.exists():
+            try:
+                current = cfg_path.read_text(encoding="utf-8")
+            except Exception:
+                current = ""
+        if current.strip() == desired.strip():
+            return False
+        cfg_path.write_text(desired, encoding="utf-8")
+
+        # Best-effort daemon refresh; okay if unavailable.
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "try-restart", "kdeconnectd.service"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=4,
+            )
+        except Exception:
+            pass
+        return True
 
     # ── Telephony signal listener ──────────────────────────────
     def connect_call_signal(self, callback):

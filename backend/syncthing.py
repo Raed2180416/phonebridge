@@ -76,6 +76,19 @@ class Syncthing:
         folder["paused"] = bool(paused)
         return self._put(f"/rest/config/folders/{folder_id}", json_body=folder)
 
+    def update_folder_path(self, folder_id, new_path):
+        folder = self.get_folder(folder_id)
+        if not folder:
+            return False
+        path = str(new_path or "").strip()
+        if not path:
+            return False
+        folder["path"] = path
+        if not self._put(f"/rest/config/folders/{folder_id}", json_body=folder):
+            return False
+        verify = self.get_folder(folder_id) or {}
+        return str(verify.get("path", "")).strip() == path
+
     def pause_folder(self, folder_id):
         return self.set_folder_paused(folder_id, True)
 

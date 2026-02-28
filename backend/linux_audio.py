@@ -42,14 +42,93 @@ class LinuxAudio:
             return False
         if self._has_pactl:
             return self._run("pactl", "set-default-sink", sink_name_or_id, timeout=3)[0]
-        return self._run("wpctl", "set-default", str(sink_name_or_id), timeout=3)[0]
+        target = self._wp_resolve_node_id("Audio/Sink", str(sink_name_or_id))
+        if not target:
+            return False
+        return self._run("wpctl", "set-default", target, timeout=3)[0]
 
     def set_default_source(self, source_name_or_id: str) -> bool:
         if not source_name_or_id:
             return False
         if self._has_pactl:
             return self._run("pactl", "set-default-source", source_name_or_id, timeout=3)[0]
-        return self._run("wpctl", "set-default", str(source_name_or_id), timeout=3)[0]
+        target = self._wp_resolve_node_id("Audio/Source", str(source_name_or_id))
+        if not target:
+            return False
+        return self._run("wpctl", "set-default", target, timeout=3)[0]
+
+    # ── Device lists + levels ───────────────────────────────────
+    def list_sinks(self):
+        if self._has_pactl:
+            return self._list_pactl_nodes("sinks", include_monitors=False, default_name=self.default_sink())
+        return self._list_pw_nodes("Audio/Sink", default_id=self._wp_default_id(section="Sinks"))
+
+    def list_sources(self):
+        if self._has_pactl:
+            return self._list_pactl_nodes("sources", include_monitors=False, default_name=self.default_source())
+        return self._list_pw_nodes("Audio/Source", default_id=self._wp_default_id(section="Sources"))
+
+    def set_sink_volume(self, sink_name_or_id: str, percent: int) -> bool:
+        pct = max(0, min(200, int(percent)))
+        target = str(sink_name_or_id or "@DEFAULT_SINK@")
+        if self._has_pactl:
+            return self._run("pactl", "set-sink-volume", target, f"{pct}%", timeout=3)[0]
+        wp_target = self._wp_resolve_node_id("Audio/Sink", str(sink_name_or_id)) or "@DEFAULT_AUDIO_SINK@"
+        return self._run("wpctl", "set-volume", wp_target, f"{pct/100.0:.2f}", timeout=3)[0]
+
+    def set_source_volume(self, source_name_or_id: str, percent: int) -> bool:
+        pct = max(0, min(200, int(percent)))
+        target = str(source_name_or_id or "@DEFAULT_SOURCE@")
+        if self._has_pactl:
+            return self._run("pactl", "set-source-volume", target, f"{pct}%", timeout=3)[0]
+        wp_target = self._wp_resolve_node_id("Audio/Source", str(source_name_or_id)) or "@DEFAULT_AUDIO_SOURCE@"
+        return self._run("wpctl", "set-volume", wp_target, f"{pct/100.0:.2f}", timeout=3)[0]
+
+    def get_sink_volume(self, sink_name_or_id: str = "") -> int | None:
+        target = str(sink_name_or_id or "@DEFAULT_SINK@")
+        if self._has_pactl:
+            ok, out = self._run("pactl", "get-sink-volume", target, timeout=3)
+            if ok:
+                m = re.search(r"\b(\d+)%", out or "")
+                if m:
+                    return int(m.group(1))
+        wp_target = self._wp_resolve_node_id("Audio/Sink", str(sink_name_or_id)) or "@DEFAULT_AUDIO_SINK@"
+        ok, out = self._run("wpctl", "get-volume", wp_target, timeout=3)
+        if ok:
+            m = re.search(r"([0-9]*\.?[0-9]+)", out or "")
+            if m:
+                return int(float(m.group(1)) * 100)
+        return None
+
+    def get_source_volume(self, source_name_or_id: str = "") -> int | None:
+        target = str(source_name_or_id or "@DEFAULT_SOURCE@")
+        if self._has_pactl:
+            ok, out = self._run("pactl", "get-source-volume", target, timeout=3)
+            if ok:
+                m = re.search(r"\b(\d+)%", out or "")
+                if m:
+                    return int(m.group(1))
+        wp_target = self._wp_resolve_node_id("Audio/Source", str(source_name_or_id)) or "@DEFAULT_AUDIO_SOURCE@"
+        ok, out = self._run("wpctl", "get-volume", wp_target, timeout=3)
+        if ok:
+            m = re.search(r"([0-9]*\.?[0-9]+)", out or "")
+            if m:
+                return int(float(m.group(1)) * 100)
+        return None
+
+    def set_source_mute(self, muted: bool, source_name_or_id: str = "") -> bool:
+        target = str(source_name_or_id or "@DEFAULT_SOURCE@")
+        if self._has_pactl:
+            return self._run("pactl", "set-source-mute", target, "1" if muted else "0", timeout=3)[0]
+        wp_target = self._wp_resolve_node_id("Audio/Source", str(source_name_or_id)) or "@DEFAULT_AUDIO_SOURCE@"
+        return self._run("wpctl", "set-mute", wp_target, "1" if muted else "0", timeout=3)[0]
+
+    def set_sink_mute(self, muted: bool, sink_name_or_id: str = "") -> bool:
+        target = str(sink_name_or_id or "@DEFAULT_SINK@")
+        if self._has_pactl:
+            return self._run("pactl", "set-sink-mute", target, "1" if muted else "0", timeout=3)[0]
+        wp_target = self._wp_resolve_node_id("Audio/Sink", str(sink_name_or_id)) or "@DEFAULT_AUDIO_SINK@"
+        return self._run("wpctl", "set-mute", wp_target, "1" if muted else "0", timeout=3)[0]
 
     # ── Bluetooth card/device discovery ────────────────────────
     def list_bt_cards(self):
@@ -130,6 +209,8 @@ class LinuxAudio:
     @staticmethod
     def _profile_priority():
         return [
+            "audio-gateway",
+            "audio_gateway",
             "handsfree_head_unit",
             "headset_head_unit",
             "hfp_hf",
@@ -144,6 +225,9 @@ class LinuxAudio:
 
     def choose_hfp_profile(self, card):
         profiles = list(card.get("profiles", []) or [])
+        usable = [p for p in profiles if str(p).strip().lower() not in {"off", "none", "disabled"}]
+        if usable:
+            profiles = usable
         if not profiles:
             return "", None
         for preferred in self._profile_priority():
@@ -364,3 +448,107 @@ class LinuxAudio:
             return rows[0]["id"] if rows else ""
 
         return pick(sinks), pick(sources)
+
+    def _list_pactl_nodes(self, section: str, *, include_monitors: bool, default_name: str):
+        ok, out = self._run("pactl", "list", "short", section, timeout=3)
+        if not ok:
+            return []
+        desc_map = self._pactl_description_map(section)
+        rows = []
+        for raw in (out or "").splitlines():
+            parts = raw.split("\t")
+            if len(parts) < 2:
+                continue
+            node_id = str(parts[0]).strip()
+            name = str(parts[1]).strip()
+            if (not include_monitors) and section == "sources" and name.endswith(".monitor"):
+                continue
+            rows.append(
+                {
+                    "id": node_id,
+                    "name": name,
+                    "description": desc_map.get(name, name),
+                    "selector": name,
+                    "is_default": name == str(default_name or "").strip(),
+                }
+            )
+        return rows
+
+    def _pactl_description_map(self, section: str):
+        # `section` must be `sinks` or `sources`
+        singular = section[:-1] if section.endswith("s") else section
+        ok, out = self._run("pactl", "list", section, timeout=4)
+        if not ok:
+            return {}
+        mapping = {}
+        current_name = ""
+        current_desc = ""
+        for raw in (out or "").splitlines():
+            line = raw.rstrip()
+            if line.startswith(f"{singular.capitalize()} #"):
+                if current_name:
+                    mapping[current_name] = current_desc or current_name
+                current_name = ""
+                current_desc = ""
+                continue
+            stripped = line.strip()
+            if stripped.startswith("Name:"):
+                current_name = stripped.split(":", 1)[1].strip()
+                continue
+            if stripped.startswith("Description:"):
+                current_desc = stripped.split(":", 1)[1].strip()
+                continue
+        if current_name:
+            mapping[current_name] = current_desc or current_name
+        return mapping
+
+    def _list_pw_nodes(self, media_class: str, *, default_id: str):
+        data = self._pw_dump()
+        if not data:
+            return []
+        rows = []
+        for obj in data:
+            if "Node" not in str(obj.get("type", "")):
+                continue
+            props = (((obj.get("info") or {}).get("props")) or {})
+            if str(props.get("media.class", "")) != media_class:
+                continue
+            node_id = str(obj.get("id", ""))
+            if not node_id:
+                continue
+            name = str(props.get("node.name", "")).strip()
+            desc = str(props.get("node.description", "") or name).strip()
+            rows.append(
+                {
+                    "id": node_id,
+                    "name": name or node_id,
+                    "description": desc or node_id,
+                    "selector": node_id,
+                    "is_default": node_id == str(default_id or ""),
+                }
+            )
+        return rows
+
+    def _wp_resolve_node_id(self, media_class: str, token: str) -> str:
+        text = str(token or "").strip()
+        if not text:
+            return ""
+        if text.isdigit():
+            return text
+        data = self._pw_dump()
+        if not data:
+            return ""
+        for obj in data:
+            if "Node" not in str(obj.get("type", "")):
+                continue
+            props = (((obj.get("info") or {}).get("props")) or {})
+            if str(props.get("media.class", "")) != media_class:
+                continue
+            node_id = str(obj.get("id", "")).strip()
+            if not node_id:
+                continue
+            node_name = str(props.get("node.name", "")).strip()
+            node_desc = str(props.get("node.description", "")).strip()
+            if text == node_name or text == node_desc:
+                return node_id
+        return ""

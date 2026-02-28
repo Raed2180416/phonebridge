@@ -1,10 +1,15 @@
 """Settings page"""
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
-                              QLabel, QPushButton, QFrame, QLineEdit, QComboBox)
+                              QLabel, QPushButton, QFrame, QLineEdit, QComboBox, QSlider)
+from PyQt6.QtCore import Qt
 from ui.theme import (card_frame, lbl, section_label, action_btn, input_field,
                       toggle_switch, divider, ToggleRow, InfoRow,
                       TEAL, CYAN, VIOLET, ROSE, AMBER, TEXT, TEXT_DIM, BORDER)
 import backend.settings_store as settings
+from backend import call_audio
+from backend import autostart
+from backend.state import state
+from backend.ui_feedback import push_toast
 
 class SettingsPage(QWidget):
     def __init__(self):
@@ -53,10 +58,10 @@ class SettingsPage(QWidget):
             save = QPushButton("Save")
             save.setStyleSheet(f"""
                 QPushButton {{
-                    background:rgba(62,240,176,0.08);border:1px solid rgba(62,240,176,0.2);
+                    background:rgba(167,139,250,0.08);border:1px solid rgba(167,139,250,0.2);
                     border-radius:8px;color:{TEAL};padding:7px 12px;font-size:11px;
                 }}
-                QPushButton:hover {{ background:rgba(62,240,176,0.18); }}
+                QPushButton:hover {{ background:rgba(167,139,250,0.18); }}
             """)
             k = key
             i = inp
@@ -95,18 +100,84 @@ class SettingsPage(QWidget):
         bl.addWidget(auto_bt)
         bl.addWidget(divider())
 
-        rich_motion = ToggleRow("🎞", "Rich Animations",
-                              "Use smooth transitions for page/dialog interactions",
-                              checked=settings.get("motion_level", "rich") == "rich")
-        rich_motion.toggled.connect(self._set_motion_level)
-        bl.addWidget(rich_motion)
-        bl.addWidget(divider())
-
         sync_data = ToggleRow("📶", "Sync on Mobile Data",
-                              "Allow Syncthing over cellular",
-                              checked=False)
+                              "Pause local Syncthing folders while phone is on mobile data",
+                              checked=settings.get("sync_on_mobile_data", False))
+        sync_data.toggled.connect(self._set_sync_on_mobile_data)
         bl.addWidget(sync_data)
         layout.addWidget(behav_frame)
+
+        # ── Call Audio ───────────────────────────────────────────
+        layout.addWidget(section_label("Call Audio (Laptop Route)"))
+        call_audio_frame = card_frame()
+        cal = QVBoxLayout(call_audio_frame)
+        cal.setContentsMargins(20, 14, 20, 14)
+        cal.setSpacing(10)
+        cal.addWidget(lbl("Changes apply live during laptop-routed calls. Outside active calls, values are saved for next call.", 10, TEXT_DIM))
+
+        output_row = QHBoxLayout()
+        output_row.addWidget(lbl("Output Device", 12, bold=True))
+        output_row.addStretch()
+        self._call_output_combo = QComboBox()
+        self._call_output_combo.setFixedWidth(360)
+        self._call_output_combo.setStyleSheet(f"""
+            QComboBox {{
+                background:rgba(255,255,255,0.05);
+                border:1px solid rgba(255,255,255,0.12);
+                border-radius:8px;color:{TEXT};padding:6px 10px;font-size:11px;
+            }}
+        """)
+        self._call_output_combo.currentIndexChanged.connect(self._on_call_output_device_changed)
+        output_row.addWidget(self._call_output_combo)
+        cal.addLayout(output_row)
+
+        input_row = QHBoxLayout()
+        input_row.addWidget(lbl("Input Device", 12, bold=True))
+        input_row.addStretch()
+        self._call_input_combo = QComboBox()
+        self._call_input_combo.setFixedWidth(360)
+        self._call_input_combo.setStyleSheet(f"""
+            QComboBox {{
+                background:rgba(255,255,255,0.05);
+                border:1px solid rgba(255,255,255,0.12);
+                border-radius:8px;color:{TEXT};padding:6px 10px;font-size:11px;
+            }}
+        """)
+        self._call_input_combo.currentIndexChanged.connect(self._on_call_input_device_changed)
+        input_row.addWidget(self._call_input_combo)
+        cal.addLayout(input_row)
+
+        out_vol_row = QHBoxLayout()
+        out_vol_row.addWidget(lbl("Output Volume", 12, bold=True))
+        out_vol_row.addStretch()
+        self._call_output_vol_value = lbl("100%", 11, TEXT_DIM, mono=True)
+        out_vol_row.addWidget(self._call_output_vol_value)
+        cal.addLayout(out_vol_row)
+        self._call_output_vol = QSlider(Qt.Orientation.Horizontal)
+        self._call_output_vol.setRange(0, 200)
+        self._call_output_vol.setSingleStep(1)
+        self._call_output_vol.valueChanged.connect(self._on_call_output_volume_changed)
+        self._call_output_vol.sliderReleased.connect(self._persist_call_output_volume)
+        cal.addWidget(self._call_output_vol)
+
+        in_vol_row = QHBoxLayout()
+        in_vol_row.addWidget(lbl("Input Volume", 12, bold=True))
+        in_vol_row.addStretch()
+        self._call_input_vol_value = lbl("100%", 11, TEXT_DIM, mono=True)
+        in_vol_row.addWidget(self._call_input_vol_value)
+        cal.addLayout(in_vol_row)
+        self._call_input_vol = QSlider(Qt.Orientation.Horizontal)
+        self._call_input_vol.setRange(0, 200)
+        self._call_input_vol.setSingleStep(1)
+        self._call_input_vol.valueChanged.connect(self._on_call_input_volume_changed)
+        self._call_input_vol.sliderReleased.connect(self._persist_call_input_volume)
+        cal.addWidget(self._call_input_vol)
+
+        refresh_audio_btn = action_btn("Refresh Audio Devices", CYAN)
+        refresh_audio_btn.clicked.connect(self._reload_call_audio_controls)
+        cal.addWidget(refresh_audio_btn)
+        layout.addWidget(call_audio_frame)
+        self._reload_call_audio_controls()
 
         # ── System ───────────────────────────────────────────────
         layout.addWidget(section_label("System"))
@@ -115,11 +186,22 @@ class SettingsPage(QWidget):
         sl.setContentsMargins(0,8,0,8)
         sl.setSpacing(0)
 
-        startup = ToggleRow("🚀","Start on Login","Run as systemd user service",checked=True)
+        startup = ToggleRow(
+            "🚀",
+            "Start on Login",
+            "Run as systemd user service",
+            checked=autostart.is_enabled(),
+        )
+        self._startup_row = startup
+        startup.toggled.connect(self._set_start_on_login)
         sl.addWidget(startup)
         sl.addWidget(divider())
         startup_check = ToggleRow("🔔","Startup Connectivity Check",
-                                   "Show popout on login",checked=True)
+                                   "Show popout on login",
+                                   checked=settings.get("startup_check_on_login", True))
+        startup_check.toggled.connect(
+            lambda v: settings.set("startup_check_on_login", bool(v))
+        )
         sl.addWidget(startup_check)
         sl.addWidget(divider())
         close_mode = ToggleRow("🗕","Close to Tray",
@@ -200,13 +282,153 @@ class SettingsPage(QWidget):
         if win and hasattr(win, "apply_visual_settings"):
             win.apply_visual_settings(theme_name=theme)
 
-    def _set_motion_level(self, enabled):
-        level = "rich" if bool(enabled) else "subtle"
-        settings.set("motion_level", level)
+    def _set_start_on_login(self, enabled):
+        target = bool(enabled)
+        ok, msg = autostart.set_enabled(target)
+        actual = autostart.is_enabled()
+        self._sync_startup_toggle(actual)
+        if (not ok) or (actual != target):
+            push_toast(
+                msg or "Could not update Start on Login",
+                "warning",
+                2800,
+            )
+            return
+        push_toast(
+            "Start on Login enabled" if target else "Start on Login disabled",
+            "success" if target else "info",
+            1700,
+        )
+
+    def _sync_startup_toggle(self, enabled):
+        if not hasattr(self, "_startup_row"):
+            return
+        toggle = self._startup_row.toggle
+        toggle.blockSignals(True)
+        toggle.setChecked(bool(enabled))
+        toggle.blockSignals(False)
+
+    def _set_sync_on_mobile_data(self, enabled):
+        settings.set("sync_on_mobile_data", bool(enabled))
         win = self.window()
-        if win and hasattr(win, "apply_visual_settings"):
-            win.apply_visual_settings(motion_level=level)
+        if win and hasattr(win, "_mobile_data_policy_tick"):
+            win._mobile_data_policy_tick()
 
     def _force_kill(self):
         import os
         os._exit(0)
+
+    def _reload_call_audio_controls(self):
+        if not hasattr(self, "_call_output_combo") or not hasattr(self, "_call_input_combo"):
+            return
+        outputs = call_audio.list_output_devices()
+        inputs = call_audio.list_input_devices()
+        selected_output = str(settings.get("call_output_device", "") or "")
+        selected_input = str(settings.get("call_input_device", "") or "")
+
+        self._call_output_combo.blockSignals(True)
+        self._call_output_combo.clear()
+        self._call_output_combo.addItem("System Default", "")
+        for row in outputs:
+            selector = str(row.get("selector") or row.get("name") or row.get("id") or "")
+            name = str(row.get("name") or selector)
+            desc = str(row.get("description") or name)
+            is_default = bool(row.get("is_default"))
+            label = desc + ("  (default)" if is_default else "")
+            self._call_output_combo.addItem(label, selector)
+        out_idx = self._call_output_combo.findData(selected_output)
+        if out_idx < 0 and selected_output:
+            for idx, row in enumerate(outputs, start=1):
+                candidates = {
+                    str(row.get("selector") or ""),
+                    str(row.get("name") or ""),
+                    str(row.get("id") or ""),
+                }
+                if selected_output in candidates:
+                    out_idx = idx
+                    break
+        out_idx = max(0, out_idx)
+        self._call_output_combo.setCurrentIndex(out_idx)
+        self._call_output_combo.blockSignals(False)
+
+        self._call_input_combo.blockSignals(True)
+        self._call_input_combo.clear()
+        self._call_input_combo.addItem("System Default", "")
+        for row in inputs:
+            selector = str(row.get("selector") or row.get("name") or row.get("id") or "")
+            name = str(row.get("name") or selector)
+            desc = str(row.get("description") or name)
+            is_default = bool(row.get("is_default"))
+            label = desc + ("  (default)" if is_default else "")
+            self._call_input_combo.addItem(label, selector)
+        in_idx = self._call_input_combo.findData(selected_input)
+        if in_idx < 0 and selected_input:
+            for idx, row in enumerate(inputs, start=1):
+                candidates = {
+                    str(row.get("selector") or ""),
+                    str(row.get("name") or ""),
+                    str(row.get("id") or ""),
+                }
+                if selected_input in candidates:
+                    in_idx = idx
+                    break
+        in_idx = max(0, in_idx)
+        self._call_input_combo.setCurrentIndex(in_idx)
+        self._call_input_combo.blockSignals(False)
+
+        out_level = int(settings.get("call_output_volume_pct", -1) or -1)
+        in_level = int(settings.get("call_input_volume_pct", -1) or -1)
+        if out_level < 0:
+            detected = call_audio.output_volume_pct()
+            out_level = detected if detected is not None else 100
+        if in_level < 0:
+            detected = call_audio.input_volume_pct()
+            in_level = detected if detected is not None else 100
+        self._call_output_vol.blockSignals(True)
+        self._call_output_vol.setValue(max(0, min(200, int(out_level))))
+        self._call_output_vol.blockSignals(False)
+        self._call_input_vol.blockSignals(True)
+        self._call_input_vol.setValue(max(0, min(200, int(in_level))))
+        self._call_input_vol.blockSignals(False)
+        self._call_output_vol_value.setText(f"{int(self._call_output_vol.value())}%")
+        self._call_input_vol_value.setText(f"{int(self._call_input_vol.value())}%")
+
+    def _on_call_output_device_changed(self):
+        value = str(self._call_output_combo.currentData() or "")
+        settings.set("call_output_device", value)
+        if self._call_route_active():
+            ok = call_audio.set_output_device(value, persist=False)
+            if not ok:
+                push_toast("Could not switch output device", "warning", 1700)
+
+    def _on_call_input_device_changed(self):
+        value = str(self._call_input_combo.currentData() or "")
+        settings.set("call_input_device", value)
+        if self._call_route_active():
+            ok = call_audio.set_input_device(value, persist=False)
+            if not ok:
+                push_toast("Could not switch input device", "warning", 1700)
+
+    def _on_call_output_volume_changed(self, value):
+        self._call_output_vol_value.setText(f"{int(value)}%")
+        if self._call_route_active():
+            call_audio.set_output_volume_pct(int(value), persist=False)
+
+    def _persist_call_output_volume(self):
+        settings.set("call_output_volume_pct", int(self._call_output_vol.value()))
+        if self._call_route_active():
+            call_audio.set_output_volume_pct(int(self._call_output_vol.value()), persist=False)
+
+    def _on_call_input_volume_changed(self, value):
+        self._call_input_vol_value.setText(f"{int(value)}%")
+        if self._call_route_active():
+            call_audio.set_input_volume_pct(int(value), persist=False)
+
+    def _persist_call_input_volume(self):
+        settings.set("call_input_volume_pct", int(self._call_input_vol.value()))
+        if self._call_route_active():
+            call_audio.set_input_volume_pct(int(self._call_input_vol.value()), persist=False)
+
+    @staticmethod
+    def _call_route_active() -> bool:
+        return bool(state.get("call_audio_active", False))

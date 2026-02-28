@@ -1,19 +1,32 @@
 """PhoneBridge main window"""
-import dbus
-import dbus.mainloop.glib
-from gi.repository import GLib
+try:
+    import dbus  # type: ignore
+    import dbus.mainloop.glib  # type: ignore
+    from gi.repository import GLib  # type: ignore
+    _HAVE_DBUS = True
+except Exception:
+    dbus = None
+    GLib = None
+    _HAVE_DBUS = False
 import logging
+import os
+import shutil
+import subprocess
 import time
 import threading
+import re
 
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QHBoxLayout,
                               QVBoxLayout, QPushButton, QStackedWidget,
                               QLabel, QScrollArea, QApplication, QFrame)
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QPoint, QPropertyAnimation, QEasingCurve, pyqtProperty
+from PyQt6.QtGui import QPainter, QColor, QFont
 from ui.theme import (
     TEAL,
+    VIOLET,
     BORDER,
     TEXT_DIM,
+    with_alpha,
     get_app_style,
     set_surface_alpha,
     refresh_card_styles,
@@ -24,7 +37,10 @@ from ui.motion import fade_in
 from backend.state import state
 import backend.settings_store as settings
 from backend import audio_route
+from backend.call_routing import normalize_call_event, should_suppress_popup
 from backend.clipboard_history import sanitize_clipboard_history
+from backend.syncthing import Syncthing
+from backend.notification_mirror import sync_desktop_notifications
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +83,8 @@ class DBusSignalBridge(QObject):
 
     def start(self):
         import threading
+        if not _HAVE_DBUS:
+            raise RuntimeError("python-dbus/gi not available; KDE integration disabled")
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
         self._loop = GLib.MainLoop()
         self._running = True
@@ -146,6 +164,109 @@ class DBusSignalBridge(QObject):
             self._running = False
 
 
+class SidebarIconButton(QPushButton):
+    """Sidebar icon button with soft bg animation and deterministic paint."""
+
+    def __init__(self, text="", parent=None, font_size: int = 15):
+        super().__init__("", parent)
+        self._icon_text = str(text or "")
+        self._font_size = max(12, int(font_size))
+        self._active = False
+        self._hovered = False
+        self._bg_opacity = 0.0
+        self._anim = QPropertyAnimation(self, b"bgOpacity", self)
+        self._anim.setDuration(150)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.setFlat(True)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setStyleSheet(
+            """
+            QPushButton {
+                background: transparent;
+                border: none;
+                border-radius: 8px;
+                padding: 0;
+                margin: 0;
+            }
+            QPushButton:focus {
+                outline: none;
+                border: none;
+            }
+            """
+        )
+
+    def getBgOpacity(self):
+        return self._bg_opacity
+
+    def setBgOpacity(self, value):
+        self._bg_opacity = float(max(0.0, min(1.0, value)))
+        self.update()
+
+    bgOpacity = pyqtProperty(float, fget=getBgOpacity, fset=setBgOpacity)
+
+    def set_active(self, active: bool):
+        self._active = bool(active)
+        target = 1.0 if self._active else (1.0 if self._hovered else 0.0)
+        self._animate_to(target)
+
+    def enterEvent(self, event):
+        self._hovered = True
+        if not self._active:
+            self._animate_to(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        if not self._active:
+            self._animate_to(0.0)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        super().mouseReleaseEvent(event)
+
+    def _animate_to(self, target: float):
+        if abs(self._bg_opacity - target) < 0.001:
+            return
+        self._anim.stop()
+        self._anim.setStartValue(self._bg_opacity)
+        self._anim.setEndValue(target)
+        self._anim.start()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.rect()
+
+        if self._bg_opacity > 0.0:
+            bg = QColor("#1a1e28")
+            bg.setAlphaF(self._bg_opacity)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(bg)
+            painter.drawRoundedRect(r, 8, 8)
+
+        if self._active:
+            icon_color = QColor(VIOLET)
+        elif self._bg_opacity > 0.05:
+            icon_color = QColor("#8892a8")
+        else:
+            icon_color = QColor("#4e5a72")
+
+        painter.setPen(icon_color)
+        font = QFont()
+        font.setPointSize(self._font_size)
+        font.setWeight(QFont.Weight.Medium)
+        painter.setFont(font)
+        painter.drawText(r, int(Qt.AlignmentFlag.AlignCenter), self._icon_text)
+        painter.end()
+
+
 class PhoneBridgeWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -153,7 +274,7 @@ class PhoneBridgeWindow(QMainWindow):
         self.setMinimumSize(960, 640)
         self.resize(1140, 740)
         self._current_opacity_pct = int(settings.get("window_opacity", 94) or 94)
-        self._current_motion = str(settings.get("motion_level", "rich") or "rich")
+        self._current_motion = str(settings.get("motion_level", "subtle") or "subtle")
         self._current_theme = str(settings.get("theme_name", "slate") or "slate")
         from ui.theme import set_motion_level
         set_motion_level(self._current_motion)
@@ -164,13 +285,16 @@ class PhoneBridgeWindow(QMainWindow):
         self.setWindowOpacity(max(0.72, min(1.0, opacity / 100.0)))
 
         self._page_map = {}
-        self._active_popups = []
+        self._call_popup = None
         self._last_clipboard_text = ""
         self._clipboard_history = []
         self._last_call_key = ""
         self._last_call_at = 0.0
         self._suspend_poll_until = 0.0
         self._force_quit = False
+        self._bridge = None
+        self._mobile_data_policy_busy = False
+        self._notif_sync_busy = False
         self._build_ui()
         self._apply_global_audio_route_startup()
         self._build_toast_layer()
@@ -179,7 +303,8 @@ class PhoneBridgeWindow(QMainWindow):
         state.set("clipboard_history", self._clipboard_history)
         self._center_on_screen()
         self._start_signal_bridge()
-        QTimer.singleShot(1800, self._auto_connect_bluetooth)
+        if settings.get("auto_bt_connect", True):
+            QTimer.singleShot(1800, self._auto_connect_bluetooth)
         clip = QApplication.clipboard()
         clip.dataChanged.connect(self._on_local_clipboard_changed)
         self._on_local_clipboard_changed()
@@ -189,13 +314,19 @@ class PhoneBridgeWindow(QMainWindow):
         self._poll_timer.start(8000)
         state.subscribe("ui_toast_queue", self._on_toast_queue)
 
+        self._policy_timer = QTimer()
+        self._policy_timer.timeout.connect(self._mobile_data_policy_tick)
+        self._policy_timer.start(15000)
+        self._mobile_data_policy_tick()
+        QTimer.singleShot(900, self._sync_notification_mirror_snapshot)
+        QTimer.singleShot(1200, self._enforce_notification_popup_policy)
+
     def _apply_global_audio_route_startup(self):
         enabled = bool(settings.get("audio_redirect", False))
-        if not enabled:
-            audio_route.stop()
-            return
-        if not audio_route.start():
+        audio_route.set_source("ui_global_toggle", enabled)
+        if not audio_route.sync():
             settings.set("audio_redirect", False)
+            audio_route.set_source("ui_global_toggle", False)
 
     def _build_ui(self):
         central = QWidget()
@@ -208,44 +339,46 @@ class PhoneBridgeWindow(QMainWindow):
         # ── Sidebar ──────────────────────────────────────────────
         sidebar = QWidget()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(72)
+        sidebar.setFixedWidth(56)
         sidebar.setStyleSheet(theme.SIDEBAR_STYLE)
         self._sidebar = sidebar
         sb = QVBoxLayout(sidebar)
-        sb.setContentsMargins(12,16,12,16)
-        sb.setSpacing(8)
+        sb.setContentsMargins(8,12,8,12)
+        sb.setSpacing(12)
 
-        logo = QLabel("⌁")
-        logo.setObjectName("sb-logo")
-        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo.setFixedHeight(42)
-        logo.mousePressEvent = lambda _: self.set_page(0)
-        sb.addWidget(logo)
-        sb.addSpacing(8)
+        self._dashboard_btn = SidebarIconButton("⌂", font_size=17)
+        self._dashboard_btn.setObjectName("sb-item")
+        self._dashboard_btn.setToolTip("Dashboard")
+        self._dashboard_btn.setFixedSize(40, 40)
+        self._dashboard_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._dashboard_btn.setAutoDefault(False)
+        self._dashboard_btn.clicked.connect(lambda _: self.set_page(0))
+        sb.addWidget(self._dashboard_btn, 0, Qt.AlignmentFlag.AlignHCenter)
+        sb.addSpacing(6)
 
         sep_widget = QWidget()
         sep_widget.setFixedHeight(1)
         sep_widget.setStyleSheet(f"background:{BORDER};border:none;")
         sb.addWidget(sep_widget)
-        sb.addSpacing(8)
+        sb.addSpacing(6)
 
         self._sb_buttons = {}
         self._stack = QStackedWidget()
 
         for i, (icon, name, PageClass, page_id) in enumerate(PAGES):
             if i == SEPARATOR_BEFORE:
-                sb.addSpacing(8)
+                sb.addSpacing(6)
                 sep2 = QWidget()
                 sep2.setFixedHeight(1)
                 sep2.setStyleSheet(f"background:{BORDER};border:none;")
                 sb.addWidget(sep2)
-                sb.addSpacing(8)
+                sb.addSpacing(6)
 
             if page_id != "dashboard":
-                btn = QPushButton(icon)
+                btn = SidebarIconButton(icon)
                 btn.setObjectName("sb-item")
                 btn.setToolTip(name)
-                btn.setFixedSize(44,44)
+                btn.setFixedSize(40, 40)
                 btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
                 btn.setAutoDefault(False)
                 btn.clicked.connect(lambda _, idx=i: self.set_page(idx))
@@ -272,10 +405,10 @@ class PhoneBridgeWindow(QMainWindow):
         current = self._stack.currentWidget()
         if current:
             fade_in(current, level=self._current_motion)
+        if hasattr(self, "_dashboard_btn") and self._dashboard_btn is not None:
+            self._dashboard_btn.set_active(index == 0)
         for page_index, btn in self._sb_buttons.items():
-            btn.setProperty("active", page_index == index)
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
+            btn.set_active(page_index == index)
 
     def go_to(self, page_id):
         if page_id in self._page_map:
@@ -308,12 +441,72 @@ class PhoneBridgeWindow(QMainWindow):
         if not self._poll_timer.isActive():
             self._poll_timer.start(8000)
         self.show()
+        self._move_to_current_workspace()
         self.raise_()
         self.activateWindow()
 
-    def run_startup_check(self):
+    def _move_to_current_workspace(self):
+        """Best-effort Hyprland move so toggle opens on the active workspace."""
+        if not shutil.which("hyprctl"):
+            return
+        try:
+            subprocess.run(
+                ["hyprctl", "dispatch", "movetoworkspacesilent", f"current,pid:{os.getpid()}"],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    def run_startup_check(
+        self,
+        from_tray: bool = False,
+        background_mode: bool = False,
+        anchor_pos=None,
+        close_on_mouse_leave: bool = False,
+    ):
         from backend.startup_check import StartupChecker
-        StartupChecker(self).run_and_show()
+        StartupChecker(self).run_and_show(
+            from_tray=bool(from_tray),
+            background_mode=bool(background_mode),
+            anchor_pos=anchor_pos,
+            close_on_mouse_leave=bool(close_on_mouse_leave),
+        )
+
+    def _ensure_call_popup(self):
+        if self._call_popup is None:
+            from ui.components.call_popup import CallPopup
+
+            self._call_popup = CallPopup(self if self.isVisible() else None)
+        self._call_popup.set_parent_window(self if self.isVisible() else None)
+        return self._call_popup
+
+    def _update_call_popup_position(self):
+        popup = self._call_popup
+        if popup is None:
+            return
+        popup.set_parent_window(self if self.isVisible() else None)
+        if popup.isVisible():
+            popup.update_position()
+
+    def _publish_call_snapshot(self, status: str, number: str, contact_name: str, audio_target: str = "phone"):
+        normalized = normalize_call_event(status)
+        state.set(
+            "call_state",
+            {"event": normalized, "number": number, "contact_name": contact_name},
+        )
+        state.set(
+            "call_ui_state",
+            {
+                "status": normalized,
+                "number": number,
+                "contact_name": contact_name,
+                "audio_target": audio_target,
+                "updated_at": int(time.time() * 1000),
+            },
+        )
 
     def _center_on_screen(self):
         screen = QApplication.primaryScreen().availableGeometry()
@@ -326,6 +519,8 @@ class PhoneBridgeWindow(QMainWindow):
         if not settings.get("kde_integration_enabled", True):
             log.info("KDE integration disabled by setting; DBus bridge not started")
             return
+        if self._bridge is not None:
+            return
         try:
             self._bridge = DBusSignalBridge()
             self._bridge.call_received.connect(self._on_call_received)
@@ -335,9 +530,26 @@ class PhoneBridgeWindow(QMainWindow):
             self._bridge.start()
         except Exception as e:
             log.exception("Signal bridge error: %s", e)
+            self._bridge = None
+
+    def set_kde_integration(self, enabled: bool):
+        target = bool(enabled)
+        settings.set("kde_integration_enabled", target)
+        if target:
+            self._start_signal_bridge()
+            self._sync_notification_mirror_snapshot()
+            return True
+        if self._bridge is not None:
+            try:
+                self._bridge.stop()
+            except Exception:
+                pass
+            self._bridge = None
+        sync_desktop_notifications([])
+        return True
 
     def _on_call_received(self, event, number, contact_name):
-        normalized_event = self._normalize_call_event(event)
+        normalized_event = normalize_call_event(event)
         call_key = f"{normalized_event}|{number}|{contact_name}"
         now = time.time()
         if call_key == self._last_call_key and (now - self._last_call_at) < 0.8:
@@ -349,28 +561,73 @@ class PhoneBridgeWindow(QMainWindow):
             "Signal callReceived raw_event=%s normalized_event=%s number=%s contact=%s",
             event, normalized_event, number, contact_name
         )
-        if settings.get("suppress_calls"):
+        outbound_origin = state.get("outbound_call_origin", {}) or {}
+        outbound_active = should_suppress_popup(normalized_event, outbound_origin, now_ms=int(time.time() * 1000))
+        if normalized_event == "ringing" and not outbound_active:
+            # Fresh incoming call sessions must not inherit stale laptop route ownership.
+            audio_route.set_source("call_pc_active", False)
+        if normalized_event == "ended":
+            audio_route.set_source("call_pc_active", False)
+            mirror_running = False
+            mirror = self.get_page("mirror")
+            if mirror and hasattr(mirror, "is_mirror_stream_running"):
+                try:
+                    mirror_running = bool(mirror.is_mirror_stream_running())
+                except Exception:
+                    mirror_running = False
+            audio_route.sync(suspend_ui_global=mirror_running)
+            popup = self._call_popup
+            if popup is not None:
+                try:
+                    popup.handle_call_event(number, contact_name, "ended")
+                except Exception:
+                    pass
+            self._publish_call_snapshot("ended", number, contact_name, "phone")
+            state.set("outbound_call_origin", {})
             return
-        for p in list(self._active_popups):
-            try:
-                p.close()
-            except Exception:
-                pass
-        from ui.components.call_popup import CallPopup
+        if normalized_event == "missed_call":
+            audio_route.set_source("call_pc_active", False)
+            mirror_running = False
+            mirror = self.get_page("mirror")
+            if mirror and hasattr(mirror, "is_mirror_stream_running"):
+                try:
+                    mirror_running = bool(mirror.is_mirror_stream_running())
+                except Exception:
+                    mirror_running = False
+            audio_route.sync(suspend_ui_global=mirror_running)
+        if normalized_event in {"ringing", "talking"}:
+            # During active/ringing calls, suppress global media redirect unless
+            # user explicitly routes call audio to PC.
+            audio_route.sync(suspend_ui_global=True)
+        if outbound_active and normalized_event in {"ringing", "talking"}:
+            # Calls started from Calls page should not spawn popup.
+            self._publish_call_snapshot(
+                normalized_event,
+                number,
+                contact_name,
+                "pc" if state.get("call_audio_active", False) else "phone",
+            )
+            calls_page = self.get_page("calls")
+            if calls_page and hasattr(calls_page, "add_call"):
+                calls_page.add_call(normalized_event, number, contact_name)
+            return
+        if settings.get("suppress_calls"):
+            self._publish_call_snapshot(
+                normalized_event,
+                number,
+                contact_name,
+                "pc" if state.get("call_audio_active", False) else "phone",
+            )
+            calls_page = self.get_page("calls")
+            if calls_page and hasattr(calls_page, "add_call"):
+                calls_page.add_call(normalized_event, number, contact_name)
+            return
         try:
-            popup = CallPopup(normalized_event, number, contact_name, self)
-            popup.destroyed.connect(lambda _: self._active_popups.remove(popup) if popup in self._active_popups else None)
-            self._active_popups.append(popup)
-            popup.show()
+            popup = self._ensure_call_popup()
+            popup.handle_call_event(number, contact_name, normalized_event)
         except Exception:
             log.exception("Failed to render call popup")
-        state.set("call_state", {"event": normalized_event, "number": number, "contact_name": contact_name})
-        state.set("call_ui_state", {
-            "status": "ringing" if normalized_event == "ringing" else normalized_event,
-            "number": number,
-            "contact_name": contact_name,
-            "updated_at": int(time.time() * 1000),
-        })
+            self._publish_call_snapshot(normalized_event, number, contact_name, "phone")
 
         # Also refresh calls page
         calls_page = self.get_page("calls")
@@ -379,10 +636,43 @@ class PhoneBridgeWindow(QMainWindow):
 
     def _on_notif_changed(self, notif_id):
         log.info("Signal notification changed id=%s", notif_id)
-        state.set("notifications", [])
+        state.set("notif_revision", {
+            "id": str(notif_id),
+            "updated_at": int(time.time() * 1000),
+        })
+        self._sync_notification_mirror_snapshot()
         messages_page = self.get_page("messages")
         if messages_page and hasattr(messages_page, "refresh"):
-            QTimer.singleShot(250, messages_page.refresh)
+            QTimer.singleShot(120, messages_page.refresh)
+
+    def _sync_notification_mirror_snapshot(self):
+        if self._notif_sync_busy:
+            return
+        if not settings.get("kde_integration_enabled", True):
+            sync_desktop_notifications([])
+            return
+        self._notif_sync_busy = True
+
+        def _job():
+            try:
+                from backend.kdeconnect import KDEConnect
+                rows = KDEConnect().get_notifications()
+                state.set("notifications", rows)
+                sync_desktop_notifications(rows)
+            except Exception:
+                log.exception("Notification mirror snapshot sync failed")
+            finally:
+                self._notif_sync_busy = False
+
+        threading.Thread(target=_job, daemon=True).start()
+
+    @staticmethod
+    def _enforce_notification_popup_policy():
+        try:
+            from backend.kdeconnect import KDEConnect
+            KDEConnect.suppress_native_notification_popups(True)
+        except Exception:
+            log.exception("Failed applying KDE notification popup policy")
 
     def _on_battery_updated(self, charge, is_charging):
         dash = self.get_page("dashboard")
@@ -396,6 +686,92 @@ class PhoneBridgeWindow(QMainWindow):
         self._push_clipboard_history(text, source="phone")
         state.set("clipboard_text", text)
         self._last_clipboard_text = text
+
+    @staticmethod
+    def _looks_like_mobile_network(name: str) -> bool:
+        text = (name or "").strip().lower()
+        if not text or text in {"unknown", "none"}:
+            return False
+        if any(k in text for k in ("wifi", "wlan", "ethernet", "lan")):
+            return False
+        return bool(re.search(r"(mobile|cell|lte|5g|4g|3g|2g|nr|hspa|edge|gprs)", text))
+
+    def _mobile_data_policy_tick(self):
+        if self._mobile_data_policy_busy:
+            return
+        self._mobile_data_policy_busy = True
+
+        def _job():
+            try:
+                from backend.kdeconnect import KDEConnect
+                net_type = ""
+                if settings.get("kde_integration_enabled", True):
+                    try:
+                        net_type = str(KDEConnect().get_network_type() or "")
+                    except Exception:
+                        net_type = ""
+                if not net_type or net_type.strip().lower() in {"", "unknown", "none"}:
+                    try:
+                        net_type = str(self.adb.get_active_network_hint() or "")
+                    except Exception:
+                        net_type = ""
+                self._apply_mobile_data_sync_policy(net_type)
+            finally:
+                self._mobile_data_policy_busy = False
+
+        threading.Thread(target=_job, daemon=True).start()
+
+    def _apply_mobile_data_sync_policy(self, network_type: str):
+        if settings.get("sync_on_mobile_data", False):
+            self._resume_auto_paused_sync_folders()
+            return
+        if not self._looks_like_mobile_network(network_type):
+            self._resume_auto_paused_sync_folders()
+            return
+        st = Syncthing()
+        if not st.is_running():
+            return
+        folders = st.get_folders() or []
+        auto_paused = []
+        for f in folders:
+            fid = str(f.get("id") or "").strip()
+            if not fid:
+                continue
+            if not bool(f.get("paused", False)):
+                if st.pause_folder(fid):
+                    auto_paused.append(fid)
+        if auto_paused:
+            state.set("mobile_data_auto_paused", auto_paused)
+            state.set("connectivity_status", {
+                **(state.get("connectivity_status", {}) or {}),
+                "sync_mobile_policy": {
+                    "actual": False,
+                    "reachable": True,
+                    "reason": f"Paused {len(auto_paused)} folders on mobile data",
+                },
+            })
+
+    def _resume_auto_paused_sync_folders(self):
+        paused = list(state.get("mobile_data_auto_paused", []) or [])
+        if not paused:
+            return
+        st = Syncthing()
+        if not st.is_running():
+            return
+        resumed = []
+        for fid in paused:
+            if st.resume_folder(str(fid)):
+                resumed.append(fid)
+        if resumed:
+            state.set("mobile_data_auto_paused", [x for x in paused if x not in resumed])
+            state.set("connectivity_status", {
+                **(state.get("connectivity_status", {}) or {}),
+                "sync_mobile_policy": {
+                    "actual": True,
+                    "reachable": True,
+                    "reason": "Resumed folders after leaving mobile data",
+                },
+            })
 
     def _on_local_clipboard_changed(self):
         try:
@@ -417,7 +793,6 @@ class PhoneBridgeWindow(QMainWindow):
             try:
                 from backend.bluetooth_manager import BluetoothManager
                 from backend.settings_store import get as sget
-                from backend.ui_feedback import push_toast
                 mgr = BluetoothManager()
                 if not mgr.available():
                     return
@@ -427,13 +802,14 @@ class PhoneBridgeWindow(QMainWindow):
                     "phone",
                     "a059",
                 ]
-                ok, msg = mgr.auto_connect_phone(name_hints)
+                ok, msg = mgr.auto_connect_phone(
+                    name_hints,
+                    call_ready_only=bool(sget("bt_call_ready_mode", False)),
+                )
                 if ok:
                     log.info("Bluetooth auto-connect: %s", msg)
-                    push_toast("Bluetooth connected to phone", "success", 1800)
                 else:
                     log.info("Bluetooth auto-connect skipped/failed: %s", msg)
-                    push_toast(f"Bluetooth: {msg}", "warning", 2200)
             except Exception:
                 log.exception("Bluetooth auto-connect failed")
 
@@ -495,7 +871,7 @@ class PhoneBridgeWindow(QMainWindow):
         self._toast_frame.setStyleSheet(f"""
             QFrame {{
                 background: rgba(12,19,32,236);
-                border: 1px solid {accent}66;
+                border: 1px solid {with_alpha(accent, 0.50)};
                 border-radius: 12px;
             }}
         """)
@@ -560,27 +936,29 @@ class PhoneBridgeWindow(QMainWindow):
         except Exception:
             log.exception("Page refresh failed")
 
-    @staticmethod
-    def _normalize_call_event(event):
-        e = (event or "").strip().lower().replace("-", "_")
-        if "missed" in e:
-            return "missed_call"
-        if e in {"ringing", "callreceived", "incoming", "incoming_call"}:
-            return "ringing"
-        if e in {"talking", "answered", "in_call", "ongoing", "active", "callstarted"}:
-            return "talking"
-        return e or "ringing"
+    # Call event normalization lives in backend/call_routing.py (pure module)
 
     def closeEvent(self, event):
         if (not self._force_quit) and settings.get("close_to_tray", True):
+            audio_route.set_source("call_pc_active", False)
+            audio_route.stop()
             self.hide()
             event.ignore()
             return
+        if self._call_popup is not None:
+            try:
+                self._call_popup.hide()
+            except Exception:
+                pass
+        audio_route.set_source("call_pc_active", False)
         audio_route.stop()
         if self._poll_timer.isActive():
             self._poll_timer.stop()
-        if hasattr(self, "_bridge"):
+        if hasattr(self, "_policy_timer") and self._policy_timer.isActive():
+            self._policy_timer.stop()
+        if self._bridge is not None:
             self._bridge.stop()
+            self._bridge = None
         QApplication.instance().quit()
         event.accept()
 
@@ -593,11 +971,17 @@ class PhoneBridgeWindow(QMainWindow):
         if not self._poll_timer.isActive():
             self._poll_timer.start(8000)
         self._position_toast()
+        self._update_call_popup_position()
         super().showEvent(event)
 
     def resizeEvent(self, event):
         self._position_toast()
+        self._update_call_popup_position()
         super().resizeEvent(event)
+
+    def moveEvent(self, event):
+        self._update_call_popup_position()
+        super().moveEvent(event)
 
     def quit_app(self):
         self._force_quit = True

@@ -21,13 +21,14 @@ from ui.theme import (
     action_btn,
     input_field,
     toggle_switch,
+    with_alpha,
     TEAL,
-    CYAN,
+    VIOLET,
     ROSE,
     TEXT,
     TEXT_DIM,
 )
-from ui.motion import breathe, fade_in
+from ui.motion import fade_in
 from backend.adb_bridge import ADBBridge
 from backend.ui_feedback import push_toast
 import backend.settings_store as settings
@@ -47,12 +48,27 @@ class MirrorPage(QWidget):
         self._webcam_record_path = ""
         self._mode = "mirror"
         self._display_orientation = 0
+        self._mirror_audio_pref_at_launch = None
+        self._last_prereq_ok_at = 0.0
         self._live_state = ""
+        self._mode_switch_in_progress = False
+        self._mode_switch_token = 0
         self._build()
+
+        from backend.state import state
+        state.subscribe("audio_redirect_enabled", self._on_audio_redirect_state_changed)
 
         self._proc_timer = QTimer(self)
         self._proc_timer.timeout.connect(self._sync_process_state)
         self._proc_timer.start(900)
+
+    @staticmethod
+    def _kill_if_alive(proc):
+        try:
+            if proc and proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
 
     def _build(self):
         root = QVBoxLayout(self)
@@ -97,14 +113,14 @@ class MirrorPage(QWidget):
                     padding: 8px 6px;
                 }}
                 QPushButton:hover:!checked {{
-                    background: rgba(255,255,255,0.06);
-                    border-color: rgba(255,255,255,0.14);
+                    background: {with_alpha(VIOLET, 0.10)};
+                    border-color: {with_alpha(VIOLET, 0.36)};
                     color: {TEXT};
                 }}
                 QPushButton:checked {{
-                    background: {TEAL}18;
-                    border-color: {TEAL}55;
-                    color: {TEAL};
+                    background: {with_alpha(VIOLET, 0.18)};
+                    border-color: {with_alpha(VIOLET, 0.54)};
+                    color: {TEXT};
                 }}
             """
             )
@@ -121,8 +137,7 @@ class MirrorPage(QWidget):
 
         self._live_dot = QFrame()
         self._live_dot.setFixedSize(9, 9)
-        self._live_dot.setStyleSheet(f"background:{TEAL};border:none;border-radius:4px;")
-        breathe(self._live_dot, min_opacity=0.28, max_opacity=1.0)
+        self._live_dot.setStyleSheet(f"background:{TEXT_DIM};border:none;border-radius:4px;")
         launch_row.addWidget(self._live_dot)
         self._live_lbl = lbl("Idle", 11, TEXT_DIM)
         launch_row.addWidget(self._live_lbl)
@@ -135,7 +150,7 @@ class MirrorPage(QWidget):
         ar.setSpacing(10)
         ar.addWidget(lbl("Route all phone audio to PC", 11, TEXT_DIM))
         ar.addStretch()
-        self._audio_toggle = toggle_switch(bool(settings.get("audio_redirect", False)), TEAL)
+        self._audio_toggle = toggle_switch(bool(settings.get("audio_redirect", False)), VIOLET)
         self._audio_toggle.toggled.connect(self._toggle_audio_route)
         ar.addWidget(self._audio_toggle)
         ll.addWidget(self._audio_row)
@@ -176,30 +191,6 @@ class MirrorPage(QWidget):
         cl.addLayout(self._controls_grid)
         root.addWidget(controls_card)
 
-        cmd_card = card_frame()
-        dl = QVBoxLayout(cmd_card)
-        dl.setContentsMargins(18, 14, 18, 14)
-        dl.setSpacing(8)
-        dl.addWidget(section_label("Session Details"))
-        self._cmd_label = QLabel("")
-        self._cmd_label.setWordWrap(True)
-        self._cmd_label.setStyleSheet(
-            f"""
-            QLabel {{
-                background: rgba(0,0,0,0.30);
-                border: 1px solid rgba(255,255,255,0.07);
-                border-radius: 10px;
-                color: {CYAN};
-                font-family: monospace;
-                font-size: 11px;
-                padding: 11px 12px;
-                line-height: 1.55;
-            }}
-        """
-        )
-        dl.addWidget(self._cmd_label)
-        root.addWidget(cmd_card)
-
         root.addStretch()
         self._update_mode_ui(animated=False)
         self.sync_global_audio_state(force=False, quiet=True)
@@ -218,14 +209,14 @@ class MirrorPage(QWidget):
                 padding: 7px 6px;
             }}
             QPushButton:hover {{
-                background: {TEAL}12;
-                border-color: {TEAL}44;
+                background: {with_alpha(VIOLET, 0.10)};
+                border-color: {with_alpha(VIOLET, 0.42)};
                 color: {TEXT};
             }}
             QPushButton:checked {{
-                background: {TEAL}1B;
-                border-color: {TEAL}66;
-                color: {TEAL};
+                background: {with_alpha(VIOLET, 0.18)};
+                border-color: {with_alpha(VIOLET, 0.54)};
+                color: {TEXT};
             }}
             QPushButton:disabled {{
                 color: {TEXT_DIM};
@@ -262,19 +253,17 @@ class MirrorPage(QWidget):
 
         if state == "recording":
             self._live_dot.setStyleSheet(f"background:{ROSE};border:none;border-radius:4px;")
-            breathe(self._live_dot, min_opacity=0.28, max_opacity=1.0)
             self._live_lbl.setText("Recording")
             self._live_lbl.setStyleSheet(f"color:{ROSE};font-size:11px;background:transparent;border:none;")
             return
 
         if state == "live":
-            self._live_dot.setStyleSheet(f"background:{TEAL};border:none;border-radius:4px;")
-            breathe(self._live_dot, min_opacity=0.28, max_opacity=1.0)
+            self._live_dot.setStyleSheet(f"background:{VIOLET};border:none;border-radius:4px;")
             self._live_lbl.setText("Live")
-            self._live_lbl.setStyleSheet(f"color:{TEAL};font-size:11px;background:transparent;border:none;")
+            self._live_lbl.setStyleSheet(f"color:{VIOLET};font-size:11px;background:transparent;border:none;")
             return
 
-        self._live_dot.setStyleSheet(f"background:{ROSE};border:none;border-radius:4px;")
+        self._live_dot.setStyleSheet(f"background:{TEXT_DIM};border:none;border-radius:4px;")
         self._live_lbl.setText("Idle")
         self._live_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:11px;background:transparent;border:none;")
 
@@ -310,8 +299,17 @@ class MirrorPage(QWidget):
         if animated:
             fade_in(self, level="subtle", start=0.88, end=1.0)
 
-        self._cmd_label.setText(self._get_cmd(self._mode))
         self._sync_launch_label()
+        self._sync_controls_enabled()
+
+    def _on_audio_redirect_state_changed(self, enabled):
+        if hasattr(self, "_audio_toggle"):
+            self._audio_toggle.blockSignals(True)
+            self._audio_toggle.setChecked(bool(enabled))
+            self._audio_toggle.blockSignals(False)
+        # Keep live mirror stream aligned with latest global audio preference.
+        if self._mode == "mirror":
+            self.sync_global_audio_state(force=False, quiet=True)
 
     def _sync_launch_label(self):
         running = self._current_proc is not None and self._current_proc.poll() is None
@@ -320,7 +318,8 @@ class MirrorPage(QWidget):
         self._set_live_indicator("live" if running else "idle")
 
     def _audio_pref_enabled(self):
-        return bool(settings.get("audio_redirect", False))
+        from backend.state import state
+        return bool(state.get("audio_redirect_enabled", False))
 
     def is_mirror_stream_running(self):
         return (
@@ -330,47 +329,62 @@ class MirrorPage(QWidget):
         )
 
     def sync_global_audio_state(self, force=False, quiet=False):
-        enabled = self._audio_pref_enabled()
-        if self._audio_toggle.isChecked() != enabled:
-            self._audio_toggle.blockSignals(True)
-            self._audio_toggle.setChecked(enabled)
-            self._audio_toggle.blockSignals(False)
-        self._cmd_label.setText(self._get_cmd(self._mode))
-
+        if self._mode_switch_in_progress:
+            return
         mirror_running = self.is_mirror_stream_running()
-        if mirror_running:
-            # Avoid duplicate audio sessions while mirror stream carries audio.
-            audio_route.stop()
-            if force:
-                self._start_main_stream()
-            return
-
-        if enabled:
-            ok = audio_route.start(self.adb)
-            if not ok:
-                settings.set("audio_redirect", False)
-                if self._audio_toggle.isChecked():
-                    self._audio_toggle.blockSignals(True)
-                    self._audio_toggle.setChecked(False)
-                    self._audio_toggle.blockSignals(False)
-                if not quiet:
-                    self._set_status("Failed to route audio to PC", "warning")
-            elif force and not quiet:
-                self._set_status("Routing phone audio to PC")
-            return
-
-        audio_route.stop()
+        desired_audio_pref = self._audio_pref_enabled()
+        if (
+            mirror_running
+            and self._mirror_audio_pref_at_launch is not None
+            and bool(self._mirror_audio_pref_at_launch) != bool(desired_audio_pref)
+        ):
+            self._set_status("Applying audio preference to active mirror stream")
+            self._start_main_stream(skip_prereqs=True)
+            mirror_running = self.is_mirror_stream_running()
+        audio_route.sync(self.adb, suspend_ui_global=mirror_running)
+        
         if force and not quiet:
-            self._set_status("Audio routing stopped")
+            enabled = self._audio_pref_enabled()
+            self._set_status("Global audio routing enabled" if enabled else "Global audio routing disabled")
 
     def _select_mode(self, mode_id):
-        if self._mode == mode_id:
+        if self._mode == mode_id or self._mode_switch_in_progress:
             return
-        stream_running = self._current_proc is not None and self._current_proc.poll() is None
-        if stream_running:
-            self._stop_main_stream()
-        self._mode = mode_id
-        self._update_mode_ui(animated=True)
+        self._mode_switch_token += 1
+        token = self._mode_switch_token
+        self._mode_switch_in_progress = True
+        for b in self._mode_btns.values():
+            b.setEnabled(False)
+        self._launch_btn.setEnabled(False)
+        self._sync_controls_enabled()
+        if self._proc_timer.isActive():
+            self._proc_timer.stop()
+        was_running = False
+        try:
+            was_running = self._current_proc is not None and self._current_proc.poll() is None
+            if was_running:
+                self._stop_main_stream(clear_status=False, sync_audio=False, wait_for_exit=True)
+            self._mode = mode_id
+            self._update_mode_ui(animated=False)
+        finally:
+            QTimer.singleShot(90, lambda t=token, wr=was_running: self._finish_mode_switch(t, wr))
+
+    def _finish_mode_switch(self, token, was_running):
+        if token != self._mode_switch_token:
+            return
+        if was_running:
+            self._start_main_stream_if_current_switch(token)
+        self._mode_switch_in_progress = False
+        for b in self._mode_btns.values():
+            b.setEnabled(True)
+        self._launch_btn.setEnabled(True)
+        self._proc_timer.start(900)
+        self._sync_controls_enabled()
+
+    def _start_main_stream_if_current_switch(self, token):
+        if token != self._mode_switch_token:
+            return
+        self._start_main_stream(skip_prereqs=True)
 
     def _get_cmd(self, mode):
         target = self.adb.target
@@ -398,7 +412,7 @@ class MirrorPage(QWidget):
             return
         self._start_main_stream()
 
-    def _ensure_prereqs(self):
+    def _ensure_prereqs(self, *, skip_connectivity=False):
         if not shutil.which("adb"):
             self._set_status("ADB is not installed", "error")
             return False
@@ -406,17 +420,18 @@ class MirrorPage(QWidget):
             self._set_status("scrcpy is not installed", "error")
             return False
 
-        if not self.adb.is_connected():
-            self.adb.connect_wifi()
-        if not self.adb.is_connected():
-            self._set_status(
-                "Phone not reachable. Open Network page, verify Tailscale/KDE, then retry.",
-                "warning",
-            )
-            win = self.window()
-            if win and hasattr(win, "go_to"):
-                win.go_to("network")
-            return False
+        if not skip_connectivity:
+            if not self.adb.is_connected():
+                self.adb.connect_wifi()
+            if not self.adb.is_connected():
+                self._set_status(
+                    "Phone not reachable. Open Network page, verify Tailscale/KDE, then retry.",
+                    "warning",
+                )
+                win = self.window()
+                if win and hasattr(win, "go_to"):
+                    win.go_to("network")
+                return False
 
         if self._mode == "webcam" and not os.path.exists("/dev/video2"):
             push_toast(
@@ -424,17 +439,20 @@ class MirrorPage(QWidget):
                 "warning",
                 3000,
             )
+        self._last_prereq_ok_at = time.time()
         return True
 
-    def _start_main_stream(self):
-        if not self._ensure_prereqs():
+    def _start_main_stream(self, skip_prereqs=False):
+        recent_ok = (time.time() - self._last_prereq_ok_at) < 6
+        if not self._ensure_prereqs(skip_connectivity=bool(skip_prereqs or recent_ok)):
             return
 
-        self._stop_main_stream(clear_status=False)
+        self._stop_main_stream(clear_status=False, sync_audio=False)
         extra = []
+        mirror_audio_pref = self._audio_pref_enabled() if self._mode == "mirror" else None
         if self._mode == "mirror" and self._display_orientation:
             extra.append(f"--display-orientation={self._display_orientation}")
-        if self._mode == "mirror" and not self._audio_pref_enabled():
+        if self._mode == "mirror" and not mirror_audio_pref:
             extra.append("--no-audio")
         if self._mode == "webcam" and os.path.exists("/dev/video2"):
             extra.append("--v4l2-sink=/dev/video2")
@@ -443,19 +461,39 @@ class MirrorPage(QWidget):
         if not self._current_proc:
             self._set_status("Could not launch scrcpy", "error")
             return
+        if self._mode == "mirror":
+            self._mirror_audio_pref_at_launch = bool(mirror_audio_pref)
+        else:
+            self._mirror_audio_pref_at_launch = None
 
         QTimer.singleShot(550, self._sync_process_state)
         self._set_status(f"{self._mode.title()} launch requested")
         self.sync_global_audio_state(force=False, quiet=True)
         self._sync_launch_label()
+        self._sync_controls_enabled()
 
-    def _stop_main_stream(self, clear_status=True):
+    def _stop_main_stream(self, clear_status=True, *, sync_audio=True, wait_for_exit=False):
         if self._current_proc:
+            proc = self._current_proc
             try:
-                self._current_proc.terminate()
+                proc.terminate()
             except Exception:
                 pass
+            if wait_for_exit:
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            else:
+                QTimer.singleShot(
+                    1400,
+                    lambda p=proc: self._kill_if_alive(p),
+                )
             self._current_proc = None
+        self._mirror_audio_pref_at_launch = None
 
         if self._mode == "webcam" and self._btn_webcam_video.isChecked():
             self._btn_webcam_video.setChecked(False)
@@ -463,16 +501,23 @@ class MirrorPage(QWidget):
 
         if clear_status:
             self._set_status("Stream stopped")
-        self.sync_global_audio_state(force=False, quiet=True)
+        if sync_audio:
+            self.sync_global_audio_state(force=False, quiet=True)
         self._sync_launch_label()
+        self._sync_controls_enabled()
 
     def _toggle_audio_route(self, checked):
-        settings.set("audio_redirect", bool(checked))
-        self.sync_global_audio_state(force=True, quiet=False)
-        if self._audio_pref_enabled():
-            self._set_status("Global audio routing enabled")
+        enabled = bool(checked)
+        if not enabled:
+            audio_route.clear_all()
         else:
-            self._set_status("Global audio routing disabled")
+            audio_route.set_source("ui_global_toggle", True)
+            settings.set("audio_redirect", True)
+        self.sync_global_audio_state(force=True, quiet=False)
+        win = self.window()
+        dash = win.get_page("dashboard") if win and hasattr(win, "get_page") else None
+        if dash and hasattr(dash, "_sync_audio_route_toggle"):
+            dash._sync_audio_route_toggle()
 
     def _toggle_screen_record(self):
         if self._btn_screen_record.isChecked():
@@ -597,8 +642,7 @@ class MirrorPage(QWidget):
         if self._mode == "mirror":
             self._display_orientation = (self._display_orientation + 90) % 360
             if self._current_proc and self._current_proc.poll() is None:
-                self._start_main_stream()
-            self._cmd_label.setText(self._get_cmd(self._mode))
+                self._start_main_stream(skip_prereqs=True)
             self._set_status(f"Mirror orientation fallback: {self._display_orientation}\N{DEGREE SIGN}")
             return
 
@@ -621,12 +665,14 @@ class MirrorPage(QWidget):
         d.exec()
 
     def _sync_process_state(self):
+        if self._mode_switch_in_progress:
+            return
         running_main = self._current_proc is not None and self._current_proc.poll() is None
         if not running_main and self._current_proc is not None:
             self._current_proc = None
-            self._set_status("Stream ended", "warning")
-
-        self.sync_global_audio_state(force=False, quiet=True)
+            self._mirror_audio_pref_at_launch = None
+            self._set_status("Stream ended", "info")
+            self.sync_global_audio_state(force=False, quiet=True)
 
         rec_proc = getattr(self.adb, "_screenrecord_proc", None)
         rec_running = rec_proc is not None and rec_proc.poll() is None
@@ -646,8 +692,49 @@ class MirrorPage(QWidget):
             self._btn_webcam_video.setText("🎬\nTake Video")
 
         self._sync_launch_label()
+        self._sync_controls_enabled()
         if rec_running or webcam_recording:
             self._set_live_indicator("recording")
 
     def refresh(self):
         self._sync_process_state()
+
+    def _sync_controls_enabled(self):
+        if self._mode_switch_in_progress:
+            self._launch_btn.setEnabled(False)
+            for btn in (
+                self._btn_screenshot,
+                self._btn_screen_record,
+                self._btn_rotate,
+                self._btn_type,
+                self._btn_webcam_photo,
+                self._btn_webcam_video,
+            ):
+                btn.setEnabled(False)
+            return
+
+        running = self._current_proc is not None and self._current_proc.poll() is None
+        self._launch_btn.setEnabled(True)
+        mirror_controls = [
+            self._btn_screenshot,
+            self._btn_screen_record,
+            self._btn_rotate,
+            self._btn_type,
+        ]
+        webcam_controls = [
+            self._btn_webcam_photo,
+            self._btn_webcam_video,
+            self._btn_rotate,
+        ]
+        if self._mode == "mirror":
+            for btn in mirror_controls:
+                btn.setEnabled(True)
+            for btn in webcam_controls:
+                if btn not in mirror_controls:
+                    btn.setEnabled(False)
+            return
+        for btn in webcam_controls:
+            btn.setEnabled(running)
+        for btn in mirror_controls:
+            if btn not in webcam_controls:
+                btn.setEnabled(False)

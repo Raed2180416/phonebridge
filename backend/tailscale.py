@@ -2,6 +2,10 @@
 import subprocess, json
 
 class Tailscale:
+    def __init__(self):
+        self._last_error = ""
+        self._last_error_kind = ""
+
     def _run(self, *args):
         try:
             r = subprocess.run(
@@ -10,9 +14,31 @@ class Tailscale:
                 text=True,
                 timeout=8,
             )
-            return r.returncode == 0, (r.stdout or r.stderr or "").strip()
+            out = (r.stdout or r.stderr or "").strip()
+            if r.returncode != 0:
+                self._last_error = out
+                self._last_error_kind = self._classify_error(out)
+            else:
+                self._last_error = ""
+                self._last_error_kind = ""
+            return r.returncode == 0, out
         except:
+            self._last_error = "tailscale command failed"
+            self._last_error_kind = "command_failed"
             return False, ""
+
+    @staticmethod
+    def _classify_error(message: str) -> str:
+        msg = (message or "").lower()
+        if (
+            "prefs write access denied" in msg
+            or "use 'sudo tailscale set --operator=$user'" in msg
+            or "operator" in msg and "access denied" in msg
+        ):
+            return "operator_permission"
+        if "failed to connect to local tailscaled" in msg or "tailscaled" in msg and "not running" in msg:
+            return "daemon_offline"
+        return "unknown"
 
     def get_status(self):
         try:
@@ -71,3 +97,14 @@ class Tailscale:
 
     def set_enabled(self, enabled: bool):
         return self.up() if bool(enabled) else self.down()
+
+    def last_error(self):
+        if self._last_error_kind == "operator_permission":
+            return (
+                "Tailscale requires operator permission. Run once:\n"
+                "sudo tailscale set --operator=$USER"
+            )
+        return self._last_error
+
+    def last_error_kind(self):
+        return self._last_error_kind
