@@ -5,6 +5,12 @@ import importlib
 import logging
 import shutil
 import subprocess
+import time
+
+try:
+    import fcntl
+except Exception:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 
 def _is_known_runtime_issue(exc: Exception) -> bool:
@@ -83,15 +89,91 @@ def _ensure_runtime_or_reexec():
     os.execvpe(steam_run, argv, env)
 
 def send_ipc_to_running(command: bytes):
-    path = f"/tmp/phonebridge-{os.getuid()}.sock"
+    for path in _candidate_socket_paths():
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.4)
+                sock.connect(path)
+                sock.sendall(command)
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def wait_and_send_ipc(command: bytes, timeout_ms: int = 5000, step_ms: int = 100) -> bool:
+    deadline = time.monotonic() + (max(0, int(timeout_ms)) / 1000.0)
+    step_s = max(10, int(step_ms)) / 1000.0
+    while time.monotonic() < deadline:
+        if send_ipc_to_running(command):
+            return True
+        time.sleep(step_s)
+    return False
+
+
+def _acquire_singleton_lock() -> tuple[int | None, bool]:
+    if fcntl is None:
+        return None, True
+    path = _lock_path()
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(0.4)
-            sock.connect(path)
-            sock.sendall(command)
-        return True
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     except OSError:
-        return False
+        return None, False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd, True
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None, False
+
+
+def _release_singleton_lock(fd: int | None) -> None:
+    if fd is None:
+        return
+    if fcntl is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _ipc_base_dir() -> str:
+    uid = os.getuid()
+    candidates = [
+        os.environ.get("XDG_RUNTIME_DIR", "").strip(),
+        f"/run/user/{uid}",
+        "/tmp",
+    ]
+    for path in candidates:
+        if not path:
+            continue
+        if os.path.isdir(path) and os.access(path, os.W_OK | os.X_OK):
+            return path
+    return "/tmp"
+
+
+def _socket_path() -> str:
+    return os.path.join(_ipc_base_dir(), f"phonebridge-{os.getuid()}.sock")
+
+
+def _candidate_socket_paths() -> list[str]:
+    primary = _socket_path()
+    legacy_tmp = f"/tmp/phonebridge-{os.getuid()}.sock"
+    out = [primary]
+    if legacy_tmp != primary:
+        out.append(legacy_tmp)
+    return out
+
+
+def _lock_path() -> str:
+    return os.path.join(_ipc_base_dir(), f"phonebridge-{os.getuid()}.lock")
 
 def main():
     _ensure_runtime_or_reexec()
@@ -101,16 +183,28 @@ def main():
     parser.add_argument('--toggle',     action='store_true')
     args = parser.parse_args()
 
-    # Enforce single-instance behavior.
+    command = b"show"
     if args.toggle:
-        if send_ipc_to_running(b"toggle"):
-            return
+        command = b"toggle"
     elif args.background:
-        if send_ipc_to_running(b"noop"):
+        command = b"noop"
+
+    # Fast-path for existing pre-lock process generations.
+    if send_ipc_to_running(command):
+        return
+
+    lock_fd, is_owner = _acquire_singleton_lock()
+    if not is_owner:
+        # Strict single-instance mode: forward and exit instead of launching.
+        if wait_and_send_ipc(command, timeout_ms=5000, step_ms=100):
+            print(f"PhoneBridge singleton: forwarded IPC command={command!r}", file=sys.stderr)
             return
-    else:
-        if send_ipc_to_running(b"show"):
-            return
+        print(
+            f"PhoneBridge singleton: lock denied and IPC forward timed out command={command!r}; "
+            "request dropped to preserve singleton behavior.",
+            file=sys.stderr,
+        )
+        return
 
     from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
     from PyQt6.QtGui import QIcon
@@ -121,6 +215,7 @@ def main():
 
     log_path = setup_logging()
     log = logging.getLogger(__name__)
+    log.info("Singleton ownership acquired (pid=%s lock_fd=%s)", os.getpid(), lock_fd)
     ensure_system_integration(os.path.dirname(os.path.abspath(__file__)))
 
     # GLib mainloop integration for D-Bus signals
@@ -137,7 +232,7 @@ def main():
     window = PhoneBridgeWindow()
 
     # ── IPC socket for --toggle ──────────────────────────────
-    sock_path = f"/tmp/phonebridge-{os.getuid()}.sock"
+    sock_path = _socket_path()
     server = None
     notifier = None
 
@@ -149,7 +244,7 @@ def main():
             log.exception("Failed to unlink IPC socket: %s", sock_path)
 
     def _cleanup_ipc():
-        nonlocal server, notifier
+        nonlocal server, notifier, lock_fd
         if notifier is not None:
             try:
                 notifier.setEnabled(False)
@@ -164,44 +259,62 @@ def main():
                 pass
             server = None
         _safe_unlink_ipc_socket()
+        _release_singleton_lock(lock_fd)
+        lock_fd = None
 
-    _safe_unlink_ipc_socket()
+    def _socket_reachable(path: str) -> bool:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.2)
+                sock.connect(path)
+                return True
+        except OSError:
+            return False
+
+    if os.path.exists(sock_path):
+        if _socket_reachable(sock_path):
+            log.error("IPC socket already active at %s while owner lock held; refusing duplicate startup", sock_path)
+            _release_singleton_lock(lock_fd)
+            raise SystemExit(3)
+        log.info("Removing stale IPC socket at %s", sock_path)
+        _safe_unlink_ipc_socket()
+
     try:
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(sock_path)
         server.listen(1)
         server.setblocking(False)
     except OSError:
-        log.exception("Failed to initialize IPC socket at %s; continuing without local IPC", sock_path)
+        log.exception("Failed to initialize IPC socket at %s; refusing startup", sock_path)
         if server is not None:
             try:
                 server.close()
             except OSError:
                 pass
-            server = None
+        _release_singleton_lock(lock_fd)
         _safe_unlink_ipc_socket()
+        raise SystemExit(3)
 
-    if server is not None:
-        notifier = QSocketNotifier(server.fileno(), QSocketNotifier.Type.Read)
+    notifier = QSocketNotifier(server.fileno(), QSocketNotifier.Type.Read)
 
-        def on_toggle():
-            try:
-                conn, _ = server.accept()
-                msg = conn.recv(16)
-                conn.close()
-                if msg == b"toggle":
-                    if window.isVisible() and window.isActiveWindow():
-                        window.hide()
-                    else:
-                        window.show_and_raise()
-                elif msg == b"show":
+    def on_toggle():
+        try:
+            conn, _ = server.accept()
+            msg = conn.recv(16)
+            conn.close()
+            if msg == b"toggle":
+                if window.isVisible() and window.isActiveWindow():
+                    window.hide()
+                else:
                     window.show_and_raise()
-                elif msg == b"noop":
-                    pass
-            except Exception:
-                log.exception("Failed to process toggle IPC message")
+            elif msg == b"show":
+                window.show_and_raise()
+            elif msg == b"noop":
+                pass
+        except Exception:
+            log.exception("Failed to process toggle IPC message")
 
-        notifier.activated.connect(on_toggle)
+    notifier.activated.connect(on_toggle)
     app.aboutToQuit.connect(_cleanup_ipc)
 
     # ── System tray ──────────────────────────────────────────
@@ -252,10 +365,7 @@ def main():
     _sync_audio_tray(state.get("audio_redirect_enabled"))
 
     menu.addSeparator()
-    menu.addAction("Quit", lambda: (
-        _cleanup_ipc(),
-        window.quit_app()
-    ))
+    menu.addAction("Quit", window.quit_app)
     tray.setContextMenu(menu)
     tray.activated.connect(
         lambda r: window.show_and_raise()

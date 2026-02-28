@@ -440,6 +440,7 @@ class PhoneBridgeWindow(QMainWindow):
     def show_and_raise(self):
         if not self._poll_timer.isActive():
             self._poll_timer.start(8000)
+        self.showNormal()
         self.show()
         self._move_to_current_workspace()
         self.raise_()
