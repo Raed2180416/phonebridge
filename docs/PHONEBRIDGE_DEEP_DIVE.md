@@ -137,6 +137,7 @@ Dependencies:
 Fallback/retry behavior:
 - Handles missing/failed reads by returning safe defaults (`None`/falsey states).
 - Fallback network type hints through ADB if KDE network type unavailable.
+- Now Playing artwork uses media-session metadata URI extraction via ADB; if URI cannot be resolved, UI falls back to icon art.
 
 Failure/recovery:
 - Toggle worker returns result tuple and UI surfaces warning/success toast.
@@ -148,6 +149,7 @@ Why this worked on this system:
 
 Reference:
 - [ui/pages/dashboard.py](/home/raed/projects/phonebridge/ui/pages/dashboard.py)
+- [backend/adb_bridge.py](/home/raed/projects/phonebridge/backend/adb_bridge.py)
 
 ### 5.2 Messages (`ui/pages/messages.py`)
 User sees:
@@ -230,6 +232,8 @@ Dependencies:
 Fallback/retry:
 - Folder list truncation with load-more for performance.
 - Custom folder IDs generated deterministically if not supplied.
+- Video thumbnails attempt `ffmpegthumbnailer` first, then `ffmpeg` frame extraction.
+- Broken/empty cached thumbnail files are invalidated and regenerated instead of being reused forever.
 
 Failure/recovery:
 - If sync update call fails, UI exposes retry state.
@@ -305,6 +309,8 @@ References:
 User sees:
 - Tailscale mesh summary + peer list.
 - Toggles for Tailscale, KDE Connect, Wi-Fi, Bluetooth, Syncthing, hotspot launcher.
+- Optional host-side KDE watchdog that can auto-recover phone KDE Connect after drops.
+- Optional phone-triggered KDE Run Commands for host lock/shutdown/logout/audio-route actions.
 
 Code path:
 - Refresh worker composes combined network payload.
@@ -312,6 +318,8 @@ Code path:
 
 Dependencies:
 - `tailscale`, `adb`, `systemctl --user`, KDE D-Bus reachability checks.
+- Optional watchdog path additionally uses `kdeconnect-cli` and systemd user timer units.
+- Optional phone command pack path uses KDE Run Commands plugin config.
 
 Fallback/retry:
 - Toggle operations verify resulting state post-command.
@@ -320,6 +328,8 @@ Fallback/retry:
 Failure/recovery:
 - On Tailscale operator-permission error, command hint is copied to clipboard.
 - UI refresh reconciles true current states after any failure.
+- Out-of-process watchdog can trigger `kdeconnect-cli --refresh` and phone app wake through ADB when Tailscale+ADB gates pass.
+- Phone-side command taps can execute desktop control commands via `kdeconnect_runcommand`.
 
 Why it worked here:
 - “Command succeeded” is not trusted; post-check verification is first-class.
@@ -329,6 +339,9 @@ References:
 - [ui/pages/network.py](/home/raed/projects/phonebridge/ui/pages/network.py)
 - [backend/connectivity_controller.py](/home/raed/projects/phonebridge/backend/connectivity_controller.py)
 - [backend/tailscale.py](/home/raed/projects/phonebridge/backend/tailscale.py)
+- [scripts/kde_watchdog.py](/home/raed/projects/phonebridge/scripts/kde_watchdog.py)
+- [scripts/kde_remote_actions.py](/home/raed/projects/phonebridge/scripts/kde_remote_actions.py)
+- [scripts/install_kde_phone_commands.sh](/home/raed/projects/phonebridge/scripts/install_kde_phone_commands.sh)
 
 ### 5.8 Settings (`ui/pages/settings.py`)
 User sees:
@@ -336,15 +349,17 @@ User sees:
 - Behavior toggles (call popups, clipboard auto-share, BT auto-connect, sync-on-mobile-data).
 - Call audio device + volume controls.
 - System controls (start on login, startup check, close-to-tray).
+- **Integration Writes (Opt-in)** section with four toggles: manage icon, manage desktop entry, manage Hyprland keybind, manage autostart. All default off.
 - Appearance theme controls and about actions.
 
 Code path:
 - Reads/writes persistent values via settings store.
 - Start-on-login toggle calls backend autostart module.
 - Call audio controls apply live when call route is active.
+- Integration toggles call `system_integration.set_*_management()` setters; enabling writes integration artifact immediately, disabling calls `disable_*()` to remove it.
 
 Dependencies:
-- settings JSON, `systemctl --user`, Linux audio tooling.
+- settings JSON, `systemctl --user`, Linux audio tooling, `backend/system_integration.py`.
 
 Fallback/retry:
 - Autostart toggle always reconciles with actual service enabled state.
@@ -366,11 +381,33 @@ References:
 ### 6.1 Core orchestration
 - [backend/state.py](/home/raed/projects/phonebridge/backend/state.py): in-memory pub/sub with Qt-safe dispatch when callbacks run from non-UI thread.
 - [backend/settings_store.py](/home/raed/projects/phonebridge/backend/settings_store.py): persistent JSON config under `~/.config/phonebridge/settings.json`.
+  - Dead keys (`theme_variant`, `surface_alpha_mode`) are stripped at load time via `_DEAD_KEYS` frozenset.
+  - Four `integration_manage_*` consent keys default to `False`; legacy installations infer consent from existing artifacts on first load.
 - [backend/logger.py](/home/raed/projects/phonebridge/backend/logger.py): structured log initialization.
+- [backend/preflight.py](/home/raed/projects/phonebridge/backend/preflight.py): one-time cached optional dependency probe. Checks 10 feature groups (`adb`, `mirror`/scrcpy, `audio_ctl`, `thumbnails`, `clipboard_wl`/`clipboard_x11`, `bluetooth_ctl`, `syncthing`, `tailscale`, `notify_send`). API: `has(feature)`, `missing_text(feature)`, `summary_lines()`. Consumed by startup popup and mirror page prereq check.
+
+Config contract (runtime-resolved, no machine literals in code):
+- `adb_target`
+- `device_id`
+- `device_name`
+- `phone_tailscale_ip`
+- `nixos_tailscale_ip`
+- `syncthing_url`
+- `syncthing_api_key`
+
+Environment overrides supported:
+- `PHONEBRIDGE_ADB_TARGET`
+- `PHONEBRIDGE_DEVICE_ID`
+- `PHONEBRIDGE_DEVICE_NAME`
+- `PHONEBRIDGE_PHONE_TAILSCALE_IP`
+- `PHONEBRIDGE_HOST_TAILSCALE_IP`
+- `PHONEBRIDGE_SYNCTHING_URL`
+- `PHONEBRIDGE_SYNCTHING_API_KEY`
 
 ### 6.2 Device and transport integrations
 - [backend/adb_bridge.py](/home/raed/projects/phonebridge/backend/adb_bridge.py): ADB command layer, target resolution, Wi-Fi/BT toggles, media/call controls, screen features.
 - [backend/kdeconnect.py](/home/raed/projects/phonebridge/backend/kdeconnect.py): D-Bus wrapper over battery, notifications, clipboard, telephony, SMS, file/share plugins.
+  - `is_reachable()` returns `bool | None`: `True` = reachable, `False` = unreachable, `None` = D-Bus exception (daemon/session-bus unavailable). Callers must distinguish `None` from `False` to avoid false-negative reporting.
 - [backend/tailscale.py](/home/raed/projects/phonebridge/backend/tailscale.py): `tailscale` CLI wrapper with error classification.
 - [backend/syncthing.py](/home/raed/projects/phonebridge/backend/syncthing.py): Syncthing REST configuration/state operations.
 - [backend/bluetooth_manager.py](/home/raed/projects/phonebridge/backend/bluetooth_manager.py): bluetoothctl/busctl/wpctl helpers for connect/disconnect/profile operations.
@@ -384,7 +421,11 @@ References:
 ### 6.4 UX/OS integration helpers
 - [backend/notification_mirror.py](/home/raed/projects/phonebridge/backend/notification_mirror.py): phone notification to desktop mirror with 2-way sync.
 - [backend/startup_check.py](/home/raed/projects/phonebridge/backend/startup_check.py): startup connectivity popup and concurrent checks.
+  - On completion, calls `preflight.summary_lines()` and surfaces up to 4 missing optional tool warnings in the popup via `_deps_lbl`.
 - [backend/system_integration.py](/home/raed/projects/phonebridge/backend/system_integration.py): desktop entry, icon, Hyprland keybind setup.
+  - All four mutation paths (icon, desktop entry, Hyprland bind, autostart) are individually gated by `integration_manage_*` consent settings. No writes occur unless the matching flag is `True`.
+  - Managed Hyprland bind is **only** `bind = SUPER, P, exec, <project>/run-venv-nix.sh --toggle`. No unrelated bindings are written.
+  - Reversible `disable_*()` helpers remove previously managed artifacts when consent is revoked.
 - [backend/autostart.py](/home/raed/projects/phonebridge/backend/autostart.py): user systemd service enable/disable.
 - [backend/clipboard_history.py](/home/raed/projects/phonebridge/backend/clipboard_history.py): history sanitization.
 - [backend/ui_feedback.py](/home/raed/projects/phonebridge/backend/ui_feedback.py): toast queue entrypoint.
@@ -543,18 +584,46 @@ References:
 - [backend/autostart.py](/home/raed/projects/phonebridge/backend/autostart.py)
 - [run-venv-nix.sh](/home/raed/projects/phonebridge/run-venv-nix.sh)
 
+### KDE watchdog integration
+- Optional user-level systemd `oneshot` service + timer for KDE drop recovery.
+- Installer script writes env config, service unit, timer unit, then reloads/enables timer.
+- Runtime checks are gated by Tailscale local state, phone peer mesh presence, and ADB device state.
+
+References:
+- [scripts/install_kde_watchdog.sh](/home/raed/projects/phonebridge/scripts/install_kde_watchdog.sh)
+- [scripts/kde_watchdog.py](/home/raed/projects/phonebridge/scripts/kde_watchdog.py)
+
+### KDE phone command-pack integration
+- Optional installer writes KDE Run Commands plugin config for a specific paired phone ID.
+- Installed commands execute host actions: lock, shutdown, logout, and phone/PC audio-route switching.
+- Command actions are implemented as deterministic CLI handlers and can auto-start PhoneBridge background mode before route changes.
+
+References:
+- [scripts/install_kde_phone_commands.sh](/home/raed/projects/phonebridge/scripts/install_kde_phone_commands.sh)
+- [scripts/kde_remote_actions.py](/home/raed/projects/phonebridge/scripts/kde_remote_actions.py)
+
 ### Desktop and keybind integration
-- App icon + desktop entry written under `~/.local/share/...`.
-- Hyprland `SUPER+P` toggle binding is injected via `~/.config/hypr/phonebridge.conf` include.
+- Each integration write is individually gated by an opt-in consent flag in settings (`integration_manage_icon`, `integration_manage_desktop_entry`, `integration_manage_hypr_bind`, `integration_manage_autostart`). All default to `False`.
+- When enabled, managed writes are:
+	- `~/.local/share/icons/hicolor/scalable/apps/phonebridge.svg` (icon)
+	- `~/.local/share/applications/phonebridge.desktop` (desktop entry)
+	- `~/.config/hypr/phonebridge.conf` — contains exactly one bind line:
+		- `bind = SUPER, P, exec, <project>/run-venv-nix.sh --toggle`
+- **No other bindings are written.** Prior SUPER+F bind (browser launch) has been removed and does not appear in the Hyprland config.
+- Consent revocation calls corresponding `disable_*()` helpers to remove previously managed artifacts.
+- Legacy installs: if settings file already exists but consent keys are missing, presence of managed artifacts on disk is used to infer and migrate consent state on first load.
 
 Reference:
 - [backend/system_integration.py](/home/raed/projects/phonebridge/backend/system_integration.py)
+- [backend/settings_store.py](/home/raed/projects/phonebridge/backend/settings_store.py)
 
 Failure/recovery behavior:
 - Integration functions are best-effort and log exceptions; app continues even if one integration step fails.
 
 Why it worked here:
-- System integration is idempotent (`write_if_changed`) and tolerant of missing optional subsystems.
+- Consent gates prevent silent writes on new installs.
+- Idempotent `write_if_changed` prevents unnecessary disk churn on repeated startups.
+- Reversible helpers allow users to cleanly undo managed changes via Settings toggles.
 
 ## 12) Hacky Workarounds and Why They Worked on This System
 ### 12.1 NixOS runtime bootstrap through `steam-run`
@@ -644,6 +713,52 @@ References:
 - [backend/autostart.py](/home/raed/projects/phonebridge/backend/autostart.py)
 - [backend/system_integration.py](/home/raed/projects/phonebridge/backend/system_integration.py)
 
+### 12.7 KDE Connect background-drop recovery via ADB wake
+Problem:
+- On some phones, KDE Connect background process drops after power-management intervention and reconnects only when app is foregrounded.
+
+Workaround:
+- Run a watchdog timer that checks `kdeconnect-cli --list-available`.
+- On repeated failures, run `kdeconnect-cli --refresh`, then (if Tailscale+ADB gates are true and cooldown allows) launch KDE Connect app on phone via `adb shell monkey`.
+
+Why it worked:
+- It mirrors the manual “open app to reconnect” action while keeping attempts bounded by debounce and cooldown.
+- Gate checks prevent pointless wake attempts when network path or ADB path is unavailable.
+
+References:
+- [scripts/kde_watchdog.py](/home/raed/projects/phonebridge/scripts/kde_watchdog.py)
+- [scripts/install_kde_watchdog.sh](/home/raed/projects/phonebridge/scripts/install_kde_watchdog.sh)
+
+### 12.8 Phone-driven host command pack via KDE Run Commands
+Problem:
+- Fast desktop-side control from phone required immediate lock/shutdown/logout and audio-route switching without opening the app UI.
+
+Workaround:
+- Provision `kdeconnect_runcommand` config for the paired phone ID with a fixed command pack.
+- Route command actions through a local Python executor that performs ordered fallback commands and audio-route backend calls.
+
+Why it worked:
+- KDE Run Commands plugin can trigger trusted desktop commands directly from phone.
+- Explicit command IDs and absolute script paths make provisioning deterministic and repeatable.
+
+References:
+- [scripts/install_kde_phone_commands.sh](/home/raed/projects/phonebridge/scripts/install_kde_phone_commands.sh)
+- [scripts/kde_remote_actions.py](/home/raed/projects/phonebridge/scripts/kde_remote_actions.py)
+
+### 12.9 Video thumbnail fallback cache self-heal
+Problem:
+- Older failed ffmpeg/ffmpegthumbnailer runs can leave zero-byte or invalid JPEG files in thumbnail cache, causing repeated icon fallback.
+
+Workaround:
+- Validate cached thumbnail file before use.
+- If cached file is invalid, delete it and regenerate through thumbnail pipeline (`ffmpegthumbnailer` then `ffmpeg`).
+
+Why it worked:
+- Prevents poisoned cache entries from short-circuiting future thumbnail generation attempts.
+
+Reference:
+- [ui/pages/files.py](/home/raed/projects/phonebridge/ui/pages/files.py)
+
 ## 13) Reliability/State Management Patterns
 ### 13.1 In-memory canonical UI state
 - Global keys for notifications, call state, route status, connectivity busy flags, toasts.
@@ -662,6 +777,8 @@ Reference:
 ### 13.3 Worker-based page refreshes
 - Each major page uses `QThread` workers for network/CLI operations.
 - Avoids UI freeze and keeps stale-safe presentation when dependencies fail.
+- Network refresh workers emit deterministic fallback payloads even on internal exceptions so UI chips do not remain stuck in `Checking`.
+- Dashboard battery panel falls back to ADB battery read when KDE battery property reads are temporarily unavailable.
 
 References:
 - [ui/pages/dashboard.py](/home/raed/projects/phonebridge/ui/pages/dashboard.py)
@@ -688,6 +805,8 @@ Evidence sources:
 - [optional_tests/test_call_mic_activation_transition.py](/home/raed/projects/phonebridge/optional_tests/test_call_mic_activation_transition.py)
 - [optional_tests/test_bluetooth_call_route_switch.py](/home/raed/projects/phonebridge/optional_tests/test_bluetooth_call_route_switch.py)
 - [optional_tests/test_adb_call_state.py](/home/raed/projects/phonebridge/optional_tests/test_adb_call_state.py)
+- [optional_tests/test_kde_watchdog.py](/home/raed/projects/phonebridge/optional_tests/test_kde_watchdog.py)
+- [optional_tests/test_kde_phone_commands.py](/home/raed/projects/phonebridge/optional_tests/test_kde_phone_commands.py)
 - [optional_tests/hardware_call_mic_harness.py](/home/raed/projects/phonebridge/optional_tests/hardware_call_mic_harness.py)
 - [optional_tests/hardware_call_mic_report.json](/home/raed/projects/phonebridge/optional_tests/hardware_call_mic_report.json)
 
@@ -696,20 +815,39 @@ What is validated:
 - Popup suppression for outbound-initiated calls.
 - BT call route release fallback behavior.
 - ADB call-state parser behavior.
+- KDE watchdog debounce/cooldown/gate behavior.
+- KDE phone command-pack installer and action execution behavior.
 - Hardware-side call mic path checks (harness script).
 
 ## 15) Known Limits / Tradeoffs / Failure Modes
-1. Hard-coded environment assumptions exist in defaults and convenience constants; portability requires per-system settings tuning.
-2. CLI-driven control paths depend on external tools being installed and executable in PATH.
-3. D-Bus integrations depend on KDE Connect daemon/plugin availability and session bus health.
-4. Bluetooth call route activation is inherently flaky across adapters/profiles; gating logic improves correctness but can delay route activation.
-5. Syncthing integration depends on API availability and valid local key config.
-6. Some controls are best-effort and intentionally non-fatal so app remains operational even with partial subsystem failure.
+
+| Feature                     | Hard requirements                                                              | Failure mode                                                                                                                       |
+| --------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Screen mirror               | `scrcpy`, `adb` in PATH; USB or wireless ADB transport active                  | Mirror page shows missing-prereq notice via `preflight.missing_text()`                                                             |
+| Call audio (BT)             | `bluetoothctl`, PipeWire/PulseAudio; BT adapter + HFP/HSP profile support      | Route marked failed; session restored to phone audio; status chip shows `failed`                                                   |
+| Call audio routing          | `pactl` or `wpctl` in PATH                                                     | Audio ctl unavailable; call stays on phone path with degraded routing status                                                       |
+| File browser thumbnails     | `ffmpegthumbnailer` or `ffmpeg` in PATH                                        | Falls back to generic icon; broken/zero-byte cached thumbs are invalidated and regenerated                                         |
+| Clipboard push (phone→host) | `wl-copy` (Wayland) or `xclip` (X11) in PATH                                   | Clipboard receive silently skipped; push (host→phone) unaffected                                                                   |
+| KDE Connect integration     | KDE Connect daemon running; D-Bus session bus healthy; device paired           | `is_reachable()` returns `None` (D-Bus down) or `False` (device not seen); UI shows `Unknown (D-Bus unavailable)` vs `Unreachable` |
+| Notifications               | KDE Connect notifications plugin enabled on phone                              | Events not received; mirror and messages page show stale or empty                                                                  |
+| SMS send/receive            | KDE Connect SMS plugin; phone app granted SMS permissions                      | SMS operations silently fail or show error toast                                                                                   |
+| Syncthing sync              | `syncthing` service running; valid API key in settings                         | Sync page shows service-warning state; folder operations fail gracefully                                                           |
+| Tailscale mesh              | `tailscale` in PATH; operator permission or `sudo` for toggle                  | Toggle fails with permission hint copied to clipboard; mesh status shows degraded                                                  |
+| Desktop integration writes  | `integration_manage_*` consent flags must be explicitly enabled (default: off) | No icon/desktop-entry/Hyprland-bind/autostart writes occur until user opts in                                                      |
+| Hyprland keybind            | Hyprland WM; `phonebridge.conf` included in `hyprland.conf`                    | Keybind absent; toggle only possible from tray                                                                                     |
+| Autostart                   | `systemctl --user` available                                                   | Autostart service not installed; app will not start on login                                                                       |
+
+Notes:
+- Dependency availability is probed once at startup by `backend/preflight.py` and surfaced in the startup popup and relevant page error messages.
+- All controls that depend on external tools are best-effort and non-fatal; app remains operational with degraded features.
+- D-Bus / KDE Connect state distinguishes three conditions: `reachable`, `unreachable`, and `unknown` (D-Bus exception). Only `unknown` blocks definitive status reporting.
 
 References:
+- [backend/preflight.py](/home/raed/projects/phonebridge/backend/preflight.py)
 - [backend/settings_store.py](/home/raed/projects/phonebridge/backend/settings_store.py)
 - [backend/connectivity_controller.py](/home/raed/projects/phonebridge/backend/connectivity_controller.py)
 - [backend/audio_route.py](/home/raed/projects/phonebridge/backend/audio_route.py)
+- [backend/kdeconnect.py](/home/raed/projects/phonebridge/backend/kdeconnect.py)
 
 ## 16) Appendix: Command Snippets + Redacted Identifiers Map
 ### 16.1 Command snippets used by architecture

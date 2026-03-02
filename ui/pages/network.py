@@ -38,71 +38,132 @@ class NetworkRefreshWorker(QThread):
         self._target = target
 
     def run(self):
-        ts = Tailscale()
-        if settings.get("tailscale_force_off", False) and ts.is_connected():
-            ts.down()
-        adb = ADBBridge(self._target)
-        st = Syncthing()
-        kc = KDEConnect()
-        status = ts.get_status() or {}
-        backend_state = str(status.get("BackendState") or "").strip()
-        connected = backend_state == "Running"
-        self_ip = ((status.get("Self", {}) or {}).get("TailscaleIPs", []) or [None])[0] if connected else None
-        peers = [
-            {
-                "name": p.get("HostName", "?"),
-                "ip": (p.get("TailscaleIPs") or ["?"])[0],
-                "online": p.get("Online", False),
-                "exit_node": p.get("ExitNode", False),
-                "os": p.get("OS", ""),
-                "relay": p.get("Relay", ""),
-            }
-            for p in (status.get("Peer", {}) or {}).values()
-        ]
-        kde_enabled = bool(settings.get("kde_integration_enabled", True))
-        kde_reachable = bool(kde_enabled and kc.is_reachable())
-        syncthing_ok = bool(st.is_running())
-        wifi = adb.get_wifi_enabled()
-        bt = adb.get_bluetooth_enabled()
         payload = {
-            "self_ip": self_ip,
-            "tailscale_state": backend_state,
-            "peers": peers,
-            "tailscale": bool(connected),
-            "kde": kde_enabled,
-            "kde_reachable": kde_reachable,
-            "syncthing": syncthing_ok,
-            "wifi_enabled": wifi,
-            "bt_enabled": bt,
-            "connectivity_status": {
-                "tailscale": {
-                    "actual": bool(connected),
-                    "reachable": bool(connected),
-                    "reason": f"state={backend_state or 'unknown'}",
-                },
-                "kde": {
-                    "actual": kde_enabled,
-                    "reachable": kde_reachable,
-                    "reason": "reachable" if kde_reachable else ("disabled" if not kde_enabled else "unreachable"),
-                },
-                "syncthing": {
-                    "actual": syncthing_ok,
-                    "reachable": syncthing_ok,
-                    "reason": "running" if syncthing_ok else "service stopped",
-                },
-                "wifi": {
-                    "actual": bool(wifi) if wifi is not None else False,
-                    "reachable": wifi is not None,
-                    "reason": "ok" if wifi is not None else "unknown",
-                },
-                "bluetooth": {
-                    "actual": bool(bt) if bt is not None else False,
-                    "reachable": bt is not None,
-                    "reason": "ok" if bt is not None else "unknown",
-                },
-            },
+            "self_ip": None,
+            "tailscale_state": "unknown",
+            "tailscale_mesh_reason": "refresh unavailable",
+            "peers": [],
+            "tailscale": False,
+            "tailscale_mesh_ready": False,
+            "kde": bool(settings.get("kde_integration_enabled", True)),
+            "kde_reachable": False,
+            "syncthing": False,
+            "syncthing_service_active": False,
+            "syncthing_api_reachable": False,
+            "syncthing_reason": "unknown",
+            "wifi_enabled": None,
+            "bt_enabled": None,
+            "connectivity_status": {},
         }
-        self.done.emit(payload)
+        try:
+            ts = Tailscale()
+            if settings.get("tailscale_force_off", False) and ts.is_connected():
+                ts.down()
+
+            adb = ADBBridge(self._target)
+            st = Syncthing()
+            kc = KDEConnect()
+
+            try:
+                snapshot = ts.get_mesh_snapshot(
+                    phone_name=settings.get("device_name", ""),
+                    phone_ip=settings.get("phone_tailscale_ip", ""),
+                )
+            except Exception:
+                snapshot = {}
+
+            backend_state = str(snapshot.get("backend_state") or "").strip()
+            local_connected = bool(snapshot.get("local_connected", False))
+            mesh_ready = bool(snapshot.get("mesh_ready", False))
+            mesh_reason = str(snapshot.get("mesh_reason") or "")
+            self_ip = snapshot.get("self_ip") if local_connected else None
+            peers = list(snapshot.get("peers", []) or [])
+
+            kde_enabled = bool(settings.get("kde_integration_enabled", True))
+            try:
+                _raw = kc.is_reachable() if kde_enabled else None
+                kde_reachable = _raw is True
+                kde_status = (
+                    "disabled" if not kde_enabled
+                    else "reachable" if _raw is True
+                    else "unreachable" if _raw is False
+                    else "unknown"
+                )
+            except Exception:
+                kde_reachable = False
+                kde_status = "unknown"
+
+            try:
+                syncthing_status = st.get_runtime_status(timeout=3)
+            except Exception:
+                syncthing_status = {
+                    "service_active": False,
+                    "api_reachable": False,
+                    "reason": "status_unavailable",
+                    "unit_state": "unknown",
+                    "unit_file_state": "unknown",
+                }
+            syncthing_service_active = bool(syncthing_status.get("service_active", False))
+            syncthing_api_reachable = bool(syncthing_status.get("api_reachable", False))
+            syncthing_reason = str(syncthing_status.get("reason") or "unknown")
+            syncthing_unit_state = str(syncthing_status.get("unit_state") or "unknown")
+            syncthing_unit_file_state = str(syncthing_status.get("unit_file_state") or "unknown")
+
+            try:
+                wifi = adb.get_wifi_enabled()
+            except Exception:
+                wifi = None
+            try:
+                bt = adb.get_bluetooth_enabled()
+            except Exception:
+                bt = None
+
+            payload = {
+                "self_ip": self_ip,
+                "tailscale_state": backend_state or "unknown",
+                "tailscale_mesh_reason": mesh_reason or "mesh unavailable",
+                "peers": peers,
+                "tailscale": bool(local_connected),
+                "tailscale_mesh_ready": bool(mesh_ready),
+                "kde": kde_enabled,
+                "kde_reachable": kde_reachable,
+                "kde_status": kde_status,
+                "syncthing": syncthing_service_active,
+                "syncthing_service_active": syncthing_service_active,
+                "syncthing_api_reachable": syncthing_api_reachable,
+                "syncthing_reason": syncthing_reason,
+                "wifi_enabled": wifi,
+                "bt_enabled": bt,
+                "connectivity_status": {
+                    "tailscale": {
+                        "actual": bool(local_connected),
+                        "reachable": bool(mesh_ready),
+                        "reason": mesh_reason or f"state={backend_state or 'unknown'}",
+                    },
+                    "kde": {
+                        "actual": kde_enabled,
+                        "reachable": kde_reachable,
+                        "reason": kde_status,
+                    },
+                    "syncthing": {
+                        "actual": syncthing_service_active,
+                        "reachable": syncthing_api_reachable,
+                        "reason": f"{syncthing_reason} (unit={syncthing_unit_state}, file={syncthing_unit_file_state})",
+                    },
+                    "wifi": {
+                        "actual": bool(wifi) if wifi is not None else False,
+                        "reachable": wifi is not None,
+                        "reason": "ok" if wifi is not None else "unknown",
+                    },
+                    "bluetooth": {
+                        "actual": bool(bt) if bt is not None else False,
+                        "reachable": bt is not None,
+                        "reason": "ok" if bt is not None else "unknown",
+                    },
+                },
+            }
+        finally:
+            self.done.emit(payload)
 
 
 class ToggleActionWorker(QThread):
@@ -205,7 +266,7 @@ class NetworkPage(QWidget):
         self._wifi_row = self._conn_toggle("⌂", "Wi-Fi", "Phone Wi-Fi radio", True, CYAN, self._toggle_wifi)
         self._bt_row = self._conn_toggle("⌬", "Bluetooth", "Phone Bluetooth radio", True, VIOLET, self._toggle_bluetooth)
         self._st_row = self._conn_toggle("↺", "Syncthing", "Folder sync service", True, TEAL, self._toggle_syncthing)
-        self._hs_row = self._conn_toggle("◉", "Hotspot", "Open phone hotspot settings", False, CYAN, self._toggle_hotspot)
+        self._hs_row = self._conn_toggle("◉", "Hotspot", "Auto: USB tether (if wired) else Wi-Fi hotspot", False, CYAN, self._toggle_hotspot)
 
         for i, row in enumerate([self._kc_row, self._wifi_row, self._bt_row, self._st_row, self._hs_row]):
             if i > 0:
@@ -293,8 +354,6 @@ class NetworkPage(QWidget):
             push_toast(msg or "Updated", "success", 1500)
         else:
             push_toast(msg or fallback_label, "warning", 1900)
-        if row is self._hs_row:
-            self._set_toggle_state(self._hs_row, False)
         self.refresh()
 
     def _on_connectivity_ops_busy(self, payload):
@@ -336,8 +395,17 @@ class NetworkPage(QWidget):
         peers = (data or {}).get("peers", []) or []
         self_ip = (data or {}).get("self_ip")
         ts_state = str((data or {}).get("tailscale_state") or "").strip()
+        mesh_ready = bool((data or {}).get("tailscale_mesh_ready", False))
+        mesh_reason = str((data or {}).get("tailscale_mesh_reason") or "").strip()
+        online_count = sum(1 for p in peers if p.get("online"))
+        total_count = len(peers)
         if self_ip:
-            self._ts_sub.setText(f"{self_ip} · {len(peers)} peers · mesh active")
+            if mesh_ready:
+                self._ts_sub.setText(f"{self_ip} · {online_count}/{total_count} devices online · mesh active")
+            else:
+                self._ts_sub.setText(
+                    f"{self_ip} · {online_count}/{total_count} devices online · {mesh_reason or 'mesh degraded'}"
+                )
         else:
             self._ts_sub.setText(f"Not connected ({ts_state or 'unknown'})")
 
@@ -359,19 +427,41 @@ class NetworkPage(QWidget):
             dot_color = TEAL if peer["online"] else TEXT_DIM
             dot.setStyleSheet(f"background:{dot_color};border:none;border-radius:4px;")
             rl.addWidget(dot)
-            rl.addWidget(lbl(peer["name"], 12, bold=True))
+            name = str(peer.get("name") or "?")
+            if peer.get("self"):
+                name = f"{name} (this laptop)"
+            rl.addWidget(lbl(name, 12, bold=True))
             rl.addStretch()
-            rl.addWidget(lbl(peer["ip"], 10, TEXT_DIM, mono=True))
+            rl.addWidget(lbl(str(peer.get("ip") or "?"), 10, TEXT_DIM, mono=True))
             self._peers_layout.addWidget(row)
 
         kde_on = bool((data or {}).get("kde", True))
         kde_reachable = bool((data or {}).get("kde_reachable", False))
+        kde_status = str((data or {}).get("kde_status") or ("reachable" if kde_reachable else ("disabled" if not kde_on else "unreachable")))
         self._set_toggle_state(self._kc_row, kde_on)
-        self._kc_row._sub.setText("Reachable" if kde_reachable else ("Disabled" if not kde_on else "Unreachable"))
+        _kde_label = {
+            "reachable": "Reachable",
+            "unreachable": "Unreachable",
+            "disabled": "Disabled",
+            "unknown": "Unknown (D-Bus unavailable)",
+        }.get(kde_status, "Unknown")
+        self._kc_row._sub.setText(_kde_label)
 
-        syncthing_on = bool((data or {}).get("syncthing", False))
-        self._set_toggle_state(self._st_row, syncthing_on)
-        self._st_row._sub.setText("Running" if syncthing_on else "Service stopped")
+        syncthing_service_active = bool((data or {}).get("syncthing_service_active", False))
+        syncthing_api_reachable = bool((data or {}).get("syncthing_api_reachable", False))
+        syncthing_reason = str((data or {}).get("syncthing_reason") or "unknown")
+        self._set_toggle_state(self._st_row, syncthing_service_active)
+        self._st_row._sub.setText(
+            (
+                "Service: active · API: reachable"
+                if syncthing_service_active and syncthing_api_reachable
+                else "Service: active · API: unreachable"
+                if syncthing_service_active
+                else "Service: inactive · API: reachable"
+                if syncthing_api_reachable
+                else f"Service: inactive · API: unreachable ({syncthing_reason})"
+            )
+        )
 
         wifi_enabled = (data or {}).get("wifi_enabled")
         if wifi_enabled is not None:
@@ -427,12 +517,9 @@ class NetworkPage(QWidget):
 
     def _toggle_hotspot(self, checked):
         def _action():
-            ok = self.adb.open_hotspot_settings()
-            if ok:
-                return True, "Opened hotspot settings on phone"
-            return False, "Could not open hotspot settings on phone"
+            return self.adb.set_hotspot_smart(bool(checked))
 
-        self._run_toggle(self._hs_row, _action, "Hotspot settings action failed")
+        self._run_toggle(self._hs_row, _action, "Hotspot toggle failed")
 
     def _toggle_bluetooth(self, checked):
         target = bool(checked)

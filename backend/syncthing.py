@@ -2,21 +2,30 @@
 import os
 import re
 import subprocess
+import shutil
+import time
 import httpx
+import backend.settings_store as settings
 
-URL = "http://127.0.0.1:8384"
-API_KEY = "fCtXuD2RX3d52R7CMTfbzynGmNrHYFQ5"
+
+def resolve_syncthing_config():
+    url = str(settings.get("syncthing_url", "http://127.0.0.1:8384") or "").strip()
+    key = str(settings.get("syncthing_api_key", "") or "").strip()
+    if not url:
+        url = "http://127.0.0.1:8384"
+    return url.rstrip("/"), key
 
 
 class Syncthing:
     def __init__(self):
-        self._h = {"X-API-Key": API_KEY}
+        self._url, self._api_key = resolve_syncthing_config()
+        self._h = {"X-API-Key": self._api_key} if self._api_key else {}
 
     def _request(self, method, ep, params=None, json_body=None, timeout=5):
         try:
             r = httpx.request(
                 method,
-                f"{URL}{ep}",
+                f"{self._url}{ep}",
                 headers=self._h,
                 params=params,
                 json=json_body,
@@ -25,6 +34,115 @@ class Syncthing:
             return r
         except Exception:
             return None
+
+    def ping_status(self, timeout=3):
+        if not self._api_key:
+            return False, None, "missing_api_key"
+        r = self._request("GET", "/rest/system/ping", timeout=timeout)
+        if not r:
+            return False, None, "request_failed"
+        if r.status_code == 200:
+            return True, 200, "ok"
+        if r.status_code in {401, 403}:
+            return False, r.status_code, "api_key_rejected"
+        return False, r.status_code, "http_error"
+
+    def service_state(self):
+        if not shutil.which("systemctl"):
+            return {
+                "service_active": False,
+                "unit_state": "unknown",
+                "unit_file_state": "unknown",
+                "load_state": "unknown",
+                "detail": "systemctl_unavailable",
+            }
+
+        unit_state = "unknown"
+        try:
+            proc = subprocess.run(
+                ["systemctl", "--user", "is-active", "syncthing.service"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            unit_state = str((proc.stdout or proc.stderr or "").strip() or "unknown")
+        except Exception:
+            unit_state = "unknown"
+
+        show = {}
+        try:
+            proc = subprocess.run(
+                [
+                    "systemctl",
+                    "--user",
+                    "show",
+                    "syncthing.service",
+                    "--property=UnitFileState",
+                    "--property=LoadState",
+                    "--property=ActiveState",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=6,
+            )
+            for line in (proc.stdout or "").splitlines():
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                show[k.strip()] = v.strip()
+        except Exception:
+            show = {}
+
+        active_state = str(show.get("ActiveState") or "").strip()
+        if active_state:
+            unit_state = active_state
+        unit_file_state = str(show.get("UnitFileState") or "unknown").strip() or "unknown"
+        load_state = str(show.get("LoadState") or "unknown").strip() or "unknown"
+        service_active = unit_state == "active"
+
+        detail = unit_state
+        if unit_file_state == "linked-runtime":
+            detail = "linked_runtime"
+        elif unit_state in {"inactive", "failed"}:
+            detail = f"unit_{unit_state}"
+
+        return {
+            "service_active": bool(service_active),
+            "unit_state": unit_state,
+            "unit_file_state": unit_file_state,
+            "load_state": load_state,
+            "detail": detail,
+        }
+
+    def get_runtime_status(self, timeout=3):
+        svc = self.service_state()
+        api_ok, api_code, api_reason = self.ping_status(timeout=timeout)
+        service_active = bool(svc.get("service_active", False))
+        api_reachable = bool(api_ok)
+
+        if service_active and api_reachable:
+            reason = "running"
+        elif service_active and not api_reachable:
+            reason = f"service_active_{api_reason}"
+        elif (not service_active) and api_reachable:
+            reason = "unit_inactive_api_reachable"
+        else:
+            reason = str(svc.get("detail") or "service_inactive")
+
+        return {
+            "service_active": service_active,
+            "api_reachable": api_reachable,
+            "unit_state": str(svc.get("unit_state") or "unknown"),
+            "unit_file_state": str(svc.get("unit_file_state") or "unknown"),
+            "load_state": str(svc.get("load_state") or "unknown"),
+            "api_status_code": api_code,
+            "api_reason": str(api_reason),
+            "mixed_state": bool(service_active != api_reachable),
+            "reason": reason,
+        }
+
+    def is_service_active(self):
+        return bool(self.service_state().get("service_active", False))
 
     def _get(self, ep, params=None, timeout=5):
         r = self._request("GET", ep, params=params, timeout=timeout)
@@ -44,7 +162,9 @@ class Syncthing:
         return bool(r and r.status_code in (200, 204))
 
     def is_running(self):
-        return self._get("/rest/system/ping") is not None
+        # Keep backward compatibility: "running" now maps to service state,
+        # not API reachability.
+        return self.is_service_active()
 
     def get_folders(self):
         folders_cfg = self._get("/rest/config/folders")
@@ -175,4 +295,12 @@ class Syncthing:
             subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         except Exception:
             return False
-        return bool(self.is_running() == bool(enabled))
+        deadline = time.time() + 5.0
+        desired = bool(enabled)
+        last = self.is_service_active()
+        while time.time() < deadline:
+            last = self.is_service_active()
+            if bool(last) == desired:
+                return True
+            time.sleep(0.35)
+        return bool(last) == desired

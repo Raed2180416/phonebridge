@@ -304,7 +304,7 @@ class FilesPage(QWidget):
                 fl.addWidget(self._file_row(
                     row["name"],
                     row["full"],
-                    allow_thumbnail=(idx < 18),
+                    allow_thumbnail=(idx < 36),
                 ))
             if truncated:
                 more_btn = action_btn("Load More", CYAN)
@@ -625,7 +625,7 @@ class FilesPage(QWidget):
 
         if ext in video_ext and os.path.exists(full_path):
             ffthumb = self._video_thumb_path(full_path)
-            if ffthumb and os.path.exists(ffthumb):
+            if ffthumb and self._is_valid_thumb_file(ffthumb):
                 pix = QPixmap(ffthumb)
                 if not pix.isNull():
                     thumb.setPixmap(pix.scaled(36, 36, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
@@ -635,37 +635,83 @@ class FilesPage(QWidget):
 
         return thumb
 
+    @staticmethod
+    def _is_valid_thumb_file(path):
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            if os.path.getsize(path) <= 0:
+                return False
+        except Exception:
+            return False
+        pix = QPixmap(path)
+        return not pix.isNull()
+
     def _video_thumb_path(self, video_path):
         cache_dir = os.path.join(tempfile.gettempdir(), "phonebridge-thumbs")
         os.makedirs(cache_dir, exist_ok=True)
-        key = hashlib.sha1(video_path.encode("utf-8")).hexdigest()
+        try:
+            st = os.stat(video_path)
+            fingerprint = f"{video_path}|{int(st.st_mtime)}|{st.st_size}"
+        except Exception:
+            fingerprint = video_path
+        key = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()
         out = os.path.join(cache_dir, f"{key}.jpg")
-        if os.path.exists(out):
+        if self._is_valid_thumb_file(out):
             return out
-        if shutil.which("ffmpegthumbnailer"):
+        if os.path.exists(out):
             try:
-                subprocess.run(
-                    ["ffmpegthumbnailer", "-i", video_path, "-o", out, "-s", "128", "-q", "8"],
-                    capture_output=True,
-                    timeout=6,
-                )
-                if os.path.exists(out):
-                    return out
+                os.remove(out)
             except Exception:
                 pass
+        if shutil.which("ffmpegthumbnailer"):
+            try:
+                proc = subprocess.run(
+                    ["ffmpegthumbnailer", "-i", video_path, "-o", out, "-s", "128", "-q", "8"],
+                    capture_output=True,
+                    text=True,
+                    timeout=6,
+                )
+                if self._is_valid_thumb_file(out):
+                    return out
+                if proc.returncode != 0:
+                    log.debug("ffmpegthumbnailer failed for %s: %s", video_path, (proc.stderr or proc.stdout or "").strip())
+            except Exception:
+                log.debug("ffmpegthumbnailer exception for %s", video_path, exc_info=True)
         if shutil.which("ffmpeg"):
             try:
-                subprocess.run(
+                proc = subprocess.run(
                     [
                         "ffmpeg", "-y", "-loglevel", "error",
                         "-ss", "00:00:01", "-i", video_path,
                         "-frames:v", "1", "-vf", "scale=128:-1", out,
                     ],
                     capture_output=True,
+                    text=True,
                     timeout=8,
                 )
-                if os.path.exists(out):
+                if self._is_valid_thumb_file(out):
                     return out
+                # Some very short clips have no frame at 1s; fallback to first frame.
+                proc2 = subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-loglevel", "error",
+                        "-i", video_path,
+                        "-frames:v", "1", "-vf", "scale=128:-1", out,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                )
+                if self._is_valid_thumb_file(out):
+                    return out
+                if proc.returncode != 0 or proc2.returncode != 0:
+                    log.debug(
+                        "ffmpeg thumbnail failed for %s: first=%s second=%s",
+                        video_path,
+                        (proc.stderr or proc.stdout or "").strip(),
+                        (proc2.stderr or proc2.stdout or "").strip(),
+                    )
             except Exception:
-                pass
+                log.debug("ffmpeg thumbnail exception for %s", video_path, exc_info=True)
         return None

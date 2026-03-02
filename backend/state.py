@@ -61,6 +61,8 @@ class AppState:
             "notif_revision": {},
             "outbound_call_origin": {},
             "mobile_data_auto_paused": [],
+            "service_health": {},
+            "kde_health": {},
         }
         self._listeners: dict[str, list[Callable[[Any], None]]] = defaultdict(list)
 

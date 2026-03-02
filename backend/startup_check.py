@@ -7,7 +7,6 @@ import subprocess
 import threading
 from typing import Callable
 
-import httpx
 from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QPoint, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFrame,
@@ -20,9 +19,8 @@ from PyQt6.QtWidgets import (
 )
 
 import backend.settings_store as settings
-
-
-API_KEY = "fCtXuD2RX3d52R7CMTfbzynGmNrHYFQ5"
+from backend.syncthing import Syncthing
+from backend import preflight
 
 
 PILL_STYLES = {
@@ -112,21 +110,19 @@ class StartupCheckWorker(QThread):
             return "offline", "Offline"
 
     def _check_syncthing(self) -> tuple[str, str]:
-        try:
-            resp = httpx.get(
-                "http://127.0.0.1:8384/rest/system/ping",
-                headers={"X-API-Key": API_KEY},
-                timeout=3,
-            )
-            if resp.status_code == 200:
-                return "online", "Online"
-            if resp.status_code in {401, 403}:
-                return "error", "API key rejected"
-            return "starting", f"HTTP {resp.status_code}"
-        except httpx.ConnectError:
+        st = Syncthing()
+        ok, status_code, reason = st.ping_status(timeout=3)
+        if ok:
+            return "online", "Online"
+        if reason == "missing_api_key":
+            return "error", "API key missing"
+        if reason == "api_key_rejected":
+            return "error", "API key rejected"
+        if reason == "request_failed":
             return "offline", "Offline"
-        except Exception:
-            return "error", "Error"
+        if status_code is not None:
+            return "starting", f"HTTP {status_code}"
+        return "error", "Error"
 
     def _check_bluetooth(self) -> tuple[str, str]:
         try:
@@ -268,7 +264,13 @@ class StartupCheckPopup(QWidget):
         }
         for key in ("tailscale", "kde", "syncthing", "bluetooth"):
             chips_wrap.addWidget(self.chips[key])
-        layout.addLayout(chips_wrap)
+        self._deps_lbl = QLabel("")
+        self._deps_lbl.setWordWrap(True)
+        self._deps_lbl.setStyleSheet(
+            "color:#f0b429;font-size:10px;border:none;background:transparent;padding:2px 0;"
+        )
+        self._deps_lbl.setVisible(False)
+        chips_wrap.addWidget(self._deps_lbl)        layout.addLayout(chips_wrap)
 
         actions = QHBoxLayout()
         actions.setContentsMargins(13, 0, 13, 13)
@@ -431,6 +433,11 @@ class StartupCheckPopup(QWidget):
     def _on_all_done(self):
         self.open_btn.setEnabled(True)
         self.open_btn.setText("Open App")
+        missing = preflight.summary_lines()
+        if missing and hasattr(self, "_deps_lbl"):
+            self._deps_lbl.setText("⚠ Missing optional tools:\n" + "\n".join(missing[:4]))
+            self._deps_lbl.setVisible(True)
+            self.adjustSize()
 
     def _auto_close_if_idle(self):
         if not self._user_interacted:

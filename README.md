@@ -113,6 +113,9 @@ Maintenance is best-effort.
 - **Folder management**  
   View all synced folders (default and custom), toggle sync on/off and browse them within the app.
 
+- **Thumbnail previews with fallback pipeline**  
+  Video thumbnails use `ffmpegthumbnailer` when available, then `ffmpeg`, with cache self-heal if a stale/broken preview is detected.
+
 <p align="center">
   <img src="pics/filesync.png" alt="File sync status" width="900" />
 </p>
@@ -126,7 +129,7 @@ Maintenance is best-effort.
 
 - **Ring, lock and DND**  
   Quickly ring or lock your phone, toggle Do-Not-Disturb, and control Wi-Fi, Bluetooth and hotspot.  
-  (Hotspot toggle opens the relevant settings screen.)
+  (Hotspot toggle uses ADB smart path: USB tether when wired, otherwise hotspot flow.)
 
 - **Screen mirror and webcam mode**  
   - Mirror phone screen  
@@ -155,10 +158,21 @@ Maintenance is best-effort.
   Disable from settings.
 
 - **Hyprland keybind**  
-  Toggle the PhoneBridge panel with a custom keybinding defined in Hyprland config.
+  Toggle the PhoneBridge panel with a managed Hyprland bind (`SUPER+P`) when opt-in is enabled.
+
+- **Startup integration writes are opt-in (default: off)**
+  - Manage App Icon
+  - Manage Desktop Entry
+  - Manage Hyprland `SUPER+P` bind
+  - Auto-enable Start on Login
+
+  Fresh installs do not mutate `~/.local/share/*`, `~/.config/hypr/*`, or autostart service state until explicitly enabled in Settings.
 
 - **Self-healing runtime on NixOS**  
   If the app encounters missing `libGL.so.1` or `dbus` modules, it automatically re-execs through `steam-run` to satisfy dependencies.
+
+- **KDE Connect auto-recovery watchdog (optional)**  
+  A user-level systemd timer can monitor KDE reachability and auto-wake the phone KDE Connect app when it drops (gated by Tailscale + ADB checks).
 
 - **Appearance and behavior settings**
   - Configure call pop-ups  
@@ -178,12 +192,26 @@ Maintenance is best-effort.
 
 PhoneBridge is designed around a specific environment (NixOS + Hyprland).
 
-Known caveats:
+### Per-feature requirements and failure modes
 
-- Hard-coded environment assumptions (paths, commands) may need tuning for other systems.
-- CLI commands rely on external tools (`adb`, `tailscale`, `syncthing`, `bluetoothctl`, `wpctl`, etc.) being available in `$PATH`.
+| Feature            | Requires                                              | Failure mode                                                                  |
+| ------------------ | ----------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Screen mirror      | `scrcpy`, `adb`                                       | Mirror page shows explicit missing-tool message                               |
+| Call audio routing | `pactl` or `wpctl` + `pw-dump`                        | Route silently unavailable; startup warns once                                |
+| Video thumbnails   | `ffmpegthumbnailer` or `ffmpeg`                       | File browser shows icon fallback (no crash)                                   |
+| Notification copy  | `wl-copy` (Wayland) or `xclip` (X11)                  | Copy action silently dropped                                                  |
+| Bluetooth toggles  | `bluetoothctl`                                        | Bluetooth page controls unavailable                                           |
+| KDE Connect bridge | D-Bus session + `kdeconnectd`                         | Reachability shows **Unknown** (not false-positive Reachable)                 |
+| Syncthing sync     | `syncthing` service + API key in config               | Sync page shows deterministic service/API split status                        |
+| Tailscale mesh     | `tailscale` CLI                                       | Mesh status shows offline; toggles disabled                                   |
+| Hotspot            | `adb` + Android `cmd wifi start-softap` or `svc wifi` | Hotspot toggle falls back between command families                            |
+| Startup writes     | All opt-in; disabled by default                       | Fresh installs do not mutate `~/.config/hypr`, `~/.local/share`, or autostart |
+
+Additional caveats:
+
 - Bluetooth call routing can be flaky; activation is gated on profile + mic path presence and rolls back if audio is unavailable.
-- Hotspot toggling opens the phone’s hotspot settings page but does not enable it automatically (work in progress).
+- KDE watchdog recovery opens KDE Connect on the phone foreground; this may briefly surface UI on devices with strict background limits.
+- Missing optional tools are reported once in the startup connectivity popup and in logs; they do not cause crashes.
 
 ---
 
@@ -224,6 +252,12 @@ This wrapper:
 - Re-executes through `steam-run` on runtime errors  
 - Exports system `dbus-python` into the venv process  
 
+Self-check the resolved Python/dbus path:
+
+```bash
+./run-venv-nix.sh --self-check
+```
+
 ---
 
 ### 4. Enable Autostart (Optional)
@@ -240,14 +274,102 @@ The service uses the Nix wrapper for background launch.
 
 ---
 
+### 5. Enable KDE Connect Auto-Recovery Watchdog (Optional)
+
+Install/update watchdog config and units:
+
+```bash
+./scripts/install_kde_watchdog.sh \
+  --device-id <kde-device-id> \
+  --phone-ip <phone-tailscale-ip> \
+  --adb-target <adb-target-ip:port> \
+  --enable
+```
+
+Verify timer and watch logs:
+
+```bash
+systemctl --user status phonebridge-kde-watchdog.timer
+journalctl --user -u phonebridge-kde-watchdog.service -f
+```
+
+Disable later if needed:
+
+```bash
+./scripts/install_kde_watchdog.sh --disable
+```
+
+---
+
+### 6. Provision KDE Phone Commands (Optional)
+
+Install KDE Connect Run Commands for your phone device:
+
+```bash
+./scripts/install_kde_phone_commands.sh --device-id <kde-device-id>
+```
+
+This installs phone-triggered laptop actions:
+- Lock Laptop
+- Shutdown Laptop (immediate)
+- Logout Laptop (immediate)
+- Audio to Phone
+- Audio to PC
+
+Verify:
+
+```bash
+systemctl --user status kdeconnectd.service
+kdeconnect-cli -d <kde-device-id> --list-commands
+```
+
+Some distro builds do not expose `kdeconnectd` as a user unit. If that happens, verify daemon process directly:
+
+```bash
+pgrep -a kdeconnectd
+```
+
+Remove command pack:
+
+```bash
+./scripts/install_kde_phone_commands.sh --device-id <kde-device-id> --remove
+```
+
+Runtime config is read from `~/.config/phonebridge/settings.json` and can be overridden with environment variables:
+
+- `PHONEBRIDGE_ADB_TARGET`
+- `PHONEBRIDGE_DEVICE_ID`
+- `PHONEBRIDGE_DEVICE_NAME`
+- `PHONEBRIDGE_PHONE_TAILSCALE_IP`
+- `PHONEBRIDGE_HOST_TAILSCALE_IP`
+- `PHONEBRIDGE_SYNCTHING_URL`
+- `PHONEBRIDGE_SYNCTHING_API_KEY`
+
+---
+
 # 📂 Project Structure
 
 ```
 main.py                    # Application entrypoint and lifecycle management
 backend/                   # System integrations (KDE Connect, ADB, Syncthing, Tailscale, audio routing, connectivity)
 ui/                        # Qt UI components, themes and pages
+scripts/kde_watchdog.py    # KDE drop watchdog (Tailscale+ADB gated recovery)
+scripts/install_kde_watchdog.sh  # Installs/updates systemd user watchdog units
+scripts/kde_remote_actions.py     # Phone-triggered laptop action executor
+scripts/install_kde_phone_commands.sh  # Installs KDE Connect phone command pack
 run-venv-nix.sh            # NixOS compatibility wrapper for venv launches
 docs/PHONEBRIDGE_DEEP_DIVE.md  # Architectural and feature walkthrough
+```
+
+## Troubleshooting Notes
+
+- Connectivity chips no longer remain stuck at `Checking` when one probe fails; refresh workers now emit deterministic fallback state.
+- Battery card falls back to ADB battery read when KDE battery property reads are temporarily unavailable.
+- Now Playing artwork now resolves media-session artwork URIs (including `content://`) through ADB; if artwork is unavailable from session metadata, it still falls back to icon.
+- If video thumbnails stay as fallback icons after older failed attempts, clear thumbnail cache and reopen the Files page:
+
+```bash
+rm -rf /tmp/phonebridge-thumbs
 ```
 
 ---

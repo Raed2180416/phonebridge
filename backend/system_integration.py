@@ -6,10 +6,12 @@ import logging
 import subprocess
 
 import backend.autostart as autostart
+import backend.settings_store as settings
 
 log = logging.getLogger(__name__)
 
 APP_ID = "phonebridge"
+HYPR_INCLUDE_LINE = "source = ~/.config/hypr/phonebridge.conf\n"
 ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
   <defs>
     <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
@@ -88,10 +90,8 @@ def ensure_hyprland_toggle_binding(project_root: Path) -> tuple[bool, str]:
     bind_conf = config_dir / "phonebridge.conf"
     main_conf = config_dir / "hyprland.conf"
     toggle_cmd = f"{project_root / 'run-venv-nix.sh'} --toggle"
-    browser_cmd = "zen"
     bind_lines = [
         f"bind = SUPER, P, exec, {toggle_cmd}\n",
-        f"bind = SUPER, F, exec, {browser_cmd}\n",
     ]
     bind_content = (
         "# Managed by PhoneBridge\n"
@@ -100,51 +100,131 @@ def ensure_hyprland_toggle_binding(project_root: Path) -> tuple[bool, str]:
     _write_if_changed(bind_conf, bind_content)
 
     if main_conf.exists():
-        include_line = "source = ~/.config/hypr/phonebridge.conf\n"
         try:
             text = main_conf.read_text(encoding="utf-8")
         except OSError as exc:
             return False, f"Cannot read Hyprland config ({exc}); skipped SUPER+P binding"
-        if include_line not in text:
+        if HYPR_INCLUDE_LINE not in text:
             try:
-                main_conf.write_text(text.rstrip() + "\n\n" + include_line, encoding="utf-8")
+                main_conf.write_text(text.rstrip() + "\n\n" + HYPR_INCLUDE_LINE, encoding="utf-8")
             except OSError as exc:
                 return False, f"Cannot update Hyprland config ({exc}); skipped SUPER+P binding"
     _run(["hyprctl", "reload"])
     return True, str(bind_conf)
 
 
+def disable_desktop_entry() -> tuple[bool, str]:
+    desktop_path = Path.home() / ".local" / "share" / "applications" / f"{APP_ID}.desktop"
+    try:
+        if desktop_path.exists():
+            desktop_path.unlink()
+        _run(["update-desktop-database", str(desktop_path.parent)])
+        return True, "Desktop entry management disabled"
+    except OSError as exc:
+        return False, f"Could not disable desktop entry management ({exc})"
+
+
+def disable_icon() -> tuple[bool, str]:
+    icon_path = Path.home() / ".local" / "share" / "icons" / "hicolor" / "scalable" / "apps" / f"{APP_ID}.svg"
+    try:
+        if icon_path.exists():
+            icon_path.unlink()
+        _run(["gtk-update-icon-cache", "-f", "-t", str(icon_path.parents[2])])
+        return True, "Icon management disabled"
+    except OSError as exc:
+        return False, f"Could not disable icon management ({exc})"
+
+
+def disable_hyprland_toggle_binding() -> tuple[bool, str]:
+    config_dir = Path.home() / ".config" / "hypr"
+    bind_conf = config_dir / "phonebridge.conf"
+    main_conf = config_dir / "hyprland.conf"
+    try:
+        if bind_conf.exists():
+            bind_conf.unlink()
+        if main_conf.exists():
+            text = main_conf.read_text(encoding="utf-8")
+            if HYPR_INCLUDE_LINE in text:
+                main_conf.write_text(text.replace(HYPR_INCLUDE_LINE, ""), encoding="utf-8")
+        _run(["hyprctl", "reload"])
+        return True, "Hyprland PhoneBridge bind management disabled"
+    except OSError as exc:
+        return False, f"Could not disable Hyprland bind management ({exc})"
+
+
+def set_desktop_entry_management(project_root: str, enabled: bool) -> tuple[bool, str]:
+    settings.set("integration_manage_desktop_entry", bool(enabled))
+    if enabled:
+        return ensure_desktop_entry(Path(project_root).resolve())
+    return disable_desktop_entry()
+
+
+def set_icon_management(enabled: bool) -> tuple[bool, str]:
+    settings.set("integration_manage_icon", bool(enabled))
+    if enabled:
+        return ensure_icon()
+    return disable_icon()
+
+
+def set_hyprland_binding_management(project_root: str, enabled: bool) -> tuple[bool, str]:
+    settings.set("integration_manage_hypr_bind", bool(enabled))
+    if enabled:
+        return ensure_hyprland_toggle_binding(Path(project_root).resolve())
+    return disable_hyprland_toggle_binding()
+
+
+def set_autostart_management(enabled: bool) -> tuple[bool, str]:
+    settings.set("integration_manage_autostart", bool(enabled))
+    if not enabled:
+        return True, "Autostart auto-management disabled"
+    if autostart.is_enabled():
+        return True, "Autostart already enabled"
+    return autostart.set_enabled(True)
+
+
 def ensure_system_integration(project_root: str) -> None:
     root = Path(project_root).resolve()
-    try:
-        ok, info = ensure_icon()
-        if ok:
-            log.info("Installed app icon: %s", info)
-    except Exception:
-        log.exception("Failed installing icon")
-
-    try:
-        ok, info = ensure_desktop_entry(root)
-        if ok:
-            log.info("Installed desktop entry: %s", info)
-    except Exception:
-        log.exception("Failed installing desktop entry")
-
-    try:
-        ok, info = ensure_hyprland_toggle_binding(root)
-        if ok:
-            log.info("Configured SUPER+P binding: %s", info)
-        else:
-            log.info(info)
-    except Exception:
-        log.exception("Failed configuring SUPER+P binding")
-
-    try:
-        if not autostart.is_enabled():
-            ok, msg = autostart.set_enabled(True)
+    if settings.get("integration_manage_icon", False):
+        try:
+            ok, info = ensure_icon()
             if ok:
-                log.info("Enabled startup service")
+                log.info("Installed app icon: %s", info)
+        except Exception:
+            log.exception("Failed installing icon")
+    else:
+        log.info("Skipped icon install (opt-in disabled)")
+
+    if settings.get("integration_manage_desktop_entry", False):
+        try:
+            ok, info = ensure_desktop_entry(root)
+            if ok:
+                log.info("Installed desktop entry: %s", info)
+        except Exception:
+            log.exception("Failed installing desktop entry")
+    else:
+        log.info("Skipped desktop entry install (opt-in disabled)")
+
+    if settings.get("integration_manage_hypr_bind", False):
+        try:
+            ok, info = ensure_hyprland_toggle_binding(root)
+            if ok:
+                log.info("Configured SUPER+P binding: %s", info)
             else:
-                log.warning("Could not enable startup service: %s", msg)
-    except Exception:
-        log.exception("Failed enabling startup service")
+                log.info(info)
+        except Exception:
+            log.exception("Failed configuring SUPER+P binding")
+    else:
+        log.info("Skipped Hyprland binding (opt-in disabled)")
+
+    if settings.get("integration_manage_autostart", False):
+        try:
+            if not autostart.is_enabled():
+                ok, msg = autostart.set_enabled(True)
+                if ok:
+                    log.info("Enabled startup service")
+                else:
+                    log.warning("Could not enable startup service: %s", msg)
+        except Exception:
+            log.exception("Failed enabling startup service")
+    else:
+        log.info("Skipped autostart enable (opt-in disabled)")

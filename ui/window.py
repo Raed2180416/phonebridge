@@ -318,6 +318,20 @@ class PhoneBridgeWindow(QMainWindow):
         self._policy_timer.timeout.connect(self._mobile_data_policy_tick)
         self._policy_timer.start(15000)
         self._mobile_data_policy_tick()
+
+        # KDE health probe: runs in background every 30 s; writes state["kde_health"]
+        self._kde_health_timer = QTimer()
+        self._kde_health_timer.timeout.connect(self._kde_health_tick)
+        self._kde_health_timer.start(30_000)
+        QTimer.singleShot(3000, self._kde_health_tick)  # first probe 3 s after startup
+
+        # Full service health probe: probes all services every 60 s;
+        # writes state["service_health"]; first run 8 s after startup
+        self._service_health_timer = QTimer()
+        self._service_health_timer.timeout.connect(self._service_health_tick)
+        self._service_health_timer.start(60_000)
+        QTimer.singleShot(8000, self._service_health_tick)
+
         QTimer.singleShot(900, self._sync_notification_mirror_snapshot)
         QTimer.singleShot(1200, self._enforce_notification_popup_policy)
 
@@ -697,6 +711,34 @@ class PhoneBridgeWindow(QMainWindow):
             return False
         return bool(re.search(r"(mobile|cell|lte|5g|4g|3g|2g|nr|hspa|edge|gprs)", text))
 
+    def _kde_health_tick(self):
+        """Background KDE reachability probe — writes state['kde_health'] without blocking UI."""
+        if not settings.get("kde_integration_enabled", True):
+            return
+
+        def _job():
+            try:
+                from backend.kdeconnect import kde_health_probe
+                result = kde_health_probe()
+                state.set("kde_health", result)
+                if result.get("status") == "degraded":
+                    log.warning(
+                        "KDE health: degraded (reachable=%s, refresh_ok=%s)",
+                        result.get("reachable"),
+                        result.get("refresh_ok"),
+                    )
+                elif result.get("status") == "ok":
+                    log.debug("KDE health: ok")
+            except Exception:
+                log.exception("KDE health probe failed")
+
+        threading.Thread(target=_job, daemon=True, name="pb-kde-health").start()
+
+    def _service_health_tick(self):
+        """Spawn a background probe of all services; writes state['service_health']."""
+        from backend.health import schedule_probe
+        schedule_probe()
+
     def _mobile_data_policy_tick(self):
         if self._mobile_data_policy_busy:
             return
@@ -957,6 +999,10 @@ class PhoneBridgeWindow(QMainWindow):
             self._poll_timer.stop()
         if hasattr(self, "_policy_timer") and self._policy_timer.isActive():
             self._policy_timer.stop()
+        if hasattr(self, "_kde_health_timer") and self._kde_health_timer.isActive():
+            self._kde_health_timer.stop()
+        if hasattr(self, "_service_health_timer") and self._service_health_timer.isActive():
+            self._service_health_timer.stop()
         if self._bridge is not None:
             self._bridge.stop()
             self._bridge = None
@@ -966,11 +1012,19 @@ class PhoneBridgeWindow(QMainWindow):
     def hideEvent(self, event):
         if self._poll_timer.isActive():
             self._poll_timer.stop()
+        if hasattr(self, "_kde_health_timer") and self._kde_health_timer.isActive():
+            self._kde_health_timer.stop()
+        if hasattr(self, "_service_health_timer") and self._service_health_timer.isActive():
+            self._service_health_timer.stop()
         super().hideEvent(event)
 
     def showEvent(self, event):
         if not self._poll_timer.isActive():
             self._poll_timer.start(8000)
+        if hasattr(self, "_kde_health_timer") and not self._kde_health_timer.isActive():
+            self._kde_health_timer.start(30_000)
+        if hasattr(self, "_service_health_timer") and not self._service_health_timer.isActive():
+            self._service_health_timer.start(60_000)
         self._position_toast()
         self._update_call_popup_position()
         super().showEvent(event)

@@ -2,7 +2,7 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                               QLabel, QPushButton, QFrame, QLineEdit,
                               QTextEdit, QComboBox, QCompleter, QApplication, QGraphicsOpacityEffect)
-from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup, pyqtSignal, QPoint, pyqtProperty, QSize
+from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup, pyqtSignal, QPoint, pyqtProperty, QSize, QThread, QObject
 import time
 from ui.theme import (card_frame, lbl, section_label, action_btn, input_field,
                       text_area, divider, with_alpha, TEAL, CYAN, VIOLET, ROSE, AMBER,
@@ -36,6 +36,52 @@ def app_color(app_name):
             return v
     return TEAL
 
+
+def _fmt_age(time_ms: int) -> str:
+    """Return a human-readable age string for a notification timestamp (ms epoch)."""
+    if not time_ms:
+        return "just now"
+    age = time.time() - time_ms / 1000.0
+    if age < 5:
+        return "just now"
+    if age < 60:
+        return f"{int(age)}s ago"
+    if age < 3600:
+        return f"{int(age // 60)}m ago"
+    if age < 86400:
+        return f"{int(age // 3600)}h ago"
+    return f"{int(age // 86400)}d ago"
+
+
+class _NotifFetchWorker(QObject):
+    """Background worker: fetches notifications off the Qt main thread."""
+    finished = pyqtSignal(list)
+
+    def __init__(self, kc: KDEConnect):
+        super().__init__()
+        self._kc = kc
+
+    def run(self):
+        try:
+            notifs = self._kc.get_notifications()
+        except Exception:
+            notifs = []
+        # Preserve existing time_ms from state for notifications we already know
+        existing: dict[str, dict] = {
+            str((r or {}).get("id") or ""): r
+            for r in (state.get("notifications") or [])
+            if (r or {}).get("id")
+        }
+        now_ms = int(time.time() * 1000)
+        for n in notifs:
+            nid = str(n.get("id") or "")
+            if not n.get("time_ms") and nid in existing and existing[nid].get("time_ms"):
+                n["time_ms"] = existing[nid]["time_ms"]
+            elif not n.get("time_ms"):
+                n["time_ms"] = now_ms
+        # Newest-first: higher time_ms first; stable secondary sort on id string
+        notifs.sort(key=lambda x: (-int(x.get("time_ms") or 0), str(x.get("id") or "")))
+        self.finished.emit(notifs)
 
 class SwipeNotifRow(QFrame):
     dismissed = pyqtSignal(str, object)
@@ -234,6 +280,7 @@ class MessagesPage(QWidget):
         self._contacts = []
         self._notif_rows = []
         self._clear_all_in_progress = False
+        self._fetch_thread: QThread | None = None
         self._build()
         state.subscribe("notif_revision", self._on_notif_revision)
         self._poll_timer = QTimer(self)
@@ -385,18 +432,33 @@ class MessagesPage(QWidget):
     def refresh(self):
         if self._clear_all_in_progress:
             return
-        # Clear
+        # If a fetch is already in flight, skip — result will arrive via _on_notifs_fetched.
+        if self._fetch_thread is not None and self._fetch_thread.isRunning():
+            return
+        self._consume_sms_draft()  # must run on Qt thread — safe here
+        thread = QThread(self)
+        worker = _NotifFetchWorker(self.kc)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_notifs_fetched)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(thread.deleteLater)
+        self._fetch_thread = thread
+        thread.start()
+
+    def _on_notifs_fetched(self, notifs: list):
+        if self._clear_all_in_progress:
+            return
+        # Clear existing rows
         self._notif_rows = []
         while self._notif_container.count():
             item = self._notif_container.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        self._consume_sms_draft()
-
-        notifs = self.kc.get_notifications()
         state.set("notifications", notifs)
         sync_desktop_notifications(notifs)
+
         if not notifs:
             empty = lbl("No notifications · check KDE Connect is connected",
                         12, TEXT_DIM)
@@ -422,7 +484,7 @@ class MessagesPage(QWidget):
 
         top = QHBoxLayout()
         app_lbl = lbl(n.get("app",""), 9, TEXT_DIM, mono=True)
-        time_lbl = lbl("just now", 9, TEXT_DIM, mono=True)
+        time_lbl = lbl(_fmt_age(n.get("time_ms", 0)), 9, TEXT_DIM, mono=True)
         top.addWidget(app_lbl)
         top.addStretch()
         top.addWidget(time_lbl)

@@ -13,11 +13,26 @@ class SyncRefreshWorker(QThread):
 
     def run(self):
         st = Syncthing()
-        if not st.is_running():
-            self.done.emit({"running": False, "folders": [], "rates": {}})
+        status = st.get_runtime_status(timeout=3)
+        service_active = bool(status.get("service_active", False))
+        api_reachable = bool(status.get("api_reachable", False))
+        if not service_active or not api_reachable:
+            self.done.emit(
+                {
+                    "running": False,
+                    "service_active": service_active,
+                    "api_reachable": api_reachable,
+                    "reason": str(status.get("reason") or "unknown"),
+                    "folders": [],
+                    "rates": {},
+                }
+            )
             return
         self.done.emit({
             "running": True,
+            "service_active": service_active,
+            "api_reachable": api_reachable,
+            "reason": str(status.get("reason") or "running"),
             "folders": st.get_folders(),
             "rates": st.get_transfer_rates(),
         })
@@ -80,8 +95,17 @@ class SyncPage(QWidget):
         self._refresh_busy = False
         if not (data or {}).get("running"):
             self._clear_folders()
-            self._folders_layout.addWidget(
-                lbl("Syncthing not running · check systemd service", 12, TEXT_DIM))
+            service_active = bool((data or {}).get("service_active", False))
+            api_reachable = bool((data or {}).get("api_reachable", False))
+            reason = str((data or {}).get("reason") or "unknown")
+            msg = (
+                "Syncthing service inactive · check systemd user unit"
+                if not service_active
+                else f"Syncthing service active but API unreachable ({reason})"
+                if not api_reachable
+                else "Syncthing unavailable"
+            )
+            self._folders_layout.addWidget(lbl(msg, 12, TEXT_DIM))
             self._speed_lbl.setText("↑ — · ↓ —")
             return
 

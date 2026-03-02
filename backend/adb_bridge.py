@@ -4,13 +4,19 @@ import os
 import logging
 import time
 import re
+import hashlib
+import tempfile
+import backend.settings_store as settings
 
-PHONE_TARGET = "100.127.0.90:5555"
+PHONE_TARGET = os.environ.get("PHONEBRIDGE_ADB_TARGET", "").strip()
 log = logging.getLogger(__name__)
 
 class ADBBridge:
-    def __init__(self, target=PHONE_TARGET):
-        self.target = target
+    def __init__(self, target=None):
+        resolved_target = target
+        if resolved_target is None:
+            resolved_target = settings.get("adb_target", PHONE_TARGET)
+        self.target = str(resolved_target or "").strip()
         self._screenrecord_proc = None
         self._screenrecord_remote_path = ""
         self._screenrecord_target = ""
@@ -19,7 +25,7 @@ class ADBBridge:
         self._cached_devices_at = 0.0
         self._last_connect_attempt_at = 0.0
         self._last_tcpip_enable_at = 0.0
-        self._active_target = target
+        self._active_target = self.target
 
     def _run_adb(self, *args, timeout=8):
         cmd = ["adb", *args]
@@ -34,6 +40,22 @@ class ADBBridge:
         except Exception as e:
             log.warning("ADB command error: %s :: %s", " ".join(cmd), e)
             return False, str(e)
+
+    def _run_adb_bytes(self, *args, timeout=8):
+        cmd = ["adb", *args]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+            if r.returncode != 0:
+                err = (r.stderr or b"").decode("utf-8", errors="ignore").strip()
+                out = (r.stdout or b"").decode("utf-8", errors="ignore").strip()
+                log.warning("ADB command failed: %s :: %s", " ".join(cmd), err or out)
+            return r.returncode == 0, (r.stdout or b""), (r.stderr or b"")
+        except subprocess.TimeoutExpired:
+            log.warning("ADB timeout: %s (timeout=%ss)", " ".join(cmd), timeout)
+            return False, b"", b"timeout"
+        except Exception as e:
+            log.warning("ADB command error: %s :: %s", " ".join(cmd), e)
+            return False, b"", str(e).encode("utf-8", errors="ignore")
 
     @staticmethod
     def _parse_adb_devices(text: str):
@@ -293,6 +315,67 @@ class ADBBridge:
         log.warning("Hotspot toggle failed enabled=%s", enabled)
         return False
 
+    def _is_usb_transport_connected(self) -> bool:
+        devices = self._get_devices(force=False)
+        for dev in devices:
+            if str(dev.get("state")) == "device" and str(dev.get("transport")) == "usb":
+                return True
+        return False
+
+    def is_usb_connected(self) -> bool:
+        if self._is_usb_transport_connected():
+            return True
+        ok, out = self._run("shell", "dumpsys", "usb", timeout=4)
+        if not ok:
+            return False
+        text = (out or "").lower()
+        return ("mconnected: true" in text) or ("mconnected=true" in text) or ("connected: true" in text)
+
+    def _set_usb_tether(self, enabled: bool):
+        if enabled:
+            attempts = [
+                ("shell", "cmd", "connectivity", "tether", "start", "usb"),
+                ("shell", "svc", "usb", "setFunctions", "rndis,adb"),
+                ("shell", "svc", "usb", "setFunctions", "rndis"),
+            ]
+        else:
+            attempts = [
+                ("shell", "cmd", "connectivity", "tether", "stop", "usb"),
+                ("shell", "svc", "usb", "setFunctions", "mtp,adb"),
+                ("shell", "svc", "usb", "setFunctions", "adb"),
+            ]
+        for args in attempts:
+            ok, _ = self._run(*args, timeout=6)
+            if ok:
+                log.info("USB tether toggle success enabled=%s using %s", enabled, " ".join(args))
+                return True
+        log.warning("USB tether toggle failed enabled=%s", enabled)
+        return False
+
+    def set_hotspot_smart(self, enabled: bool):
+        """
+        Enable connectivity sharing with priority:
+        1) USB tethering when USB is connected
+        2) Wi-Fi hotspot otherwise
+        Never opens Android settings automatically.
+        """
+        desired = bool(enabled)
+        if not desired:
+            usb_ok = self._set_usb_tether(False)
+            hs_ok = self.set_hotspot(False)
+            if usb_ok or hs_ok:
+                return True, "Tethering and hotspot disabled", False
+            return False, "Could not disable tethering/hotspot", None
+
+        usb_connected = self.is_usb_connected()
+        if usb_connected:
+            if self._set_usb_tether(True):
+                return True, "USB tethering enabled (USB detected)", True
+            log.warning("USB connected but USB tethering failed; trying Wi-Fi hotspot fallback")
+        if self.set_hotspot(True):
+            return True, ("Wi-Fi hotspot enabled" if not usb_connected else "Wi-Fi hotspot enabled (USB tethering failed)"), True
+        return False, "Could not enable USB tethering or Wi-Fi hotspot", None
+
     def set_wifi(self, enabled: bool):
         ok, _ = self._run("shell", "cmd", "wifi", "set-wifi-enabled", "enabled" if enabled else "disabled")
         if not ok:
@@ -503,6 +586,7 @@ class ADBBridge:
         import re
         sessions = []
         current = None
+        in_metadata = False
         for raw in out.splitlines():
             line = raw.rstrip()
             header = re.match(r"^\s{4}(.+?) ([a-zA-Z0-9\._]+)/[^/]+/\d+ \(userId=\d+\)$", line)
@@ -517,7 +601,10 @@ class ADBBridge:
                     "title": "",
                     "artist": "",
                     "album": "",
+                    "artwork": "",
+                    "media_uri": "",
                 }
+                in_metadata = False
                 continue
             if not current:
                 continue
@@ -536,6 +623,22 @@ class ADBBridge:
                     current["artist"] = parts[1]
                 if len(parts) > 2:
                     current["album"] = parts[2]
+            if re.match(r"^\s*metadata:", line):
+                in_metadata = True
+            elif in_metadata and re.match(r"^\s{4}\S", line):
+                # New top-level block starts; metadata block ended.
+                in_metadata = False
+            if in_metadata:
+                kv = line.strip()
+                # Common dumpsys keys when media metadata includes artwork pointers.
+                if "ALBUM_ART_URI=" in kv:
+                    current["artwork"] = kv.split("ALBUM_ART_URI=", 1)[1].strip()
+                elif "ART_URI=" in kv and "ALBUM_ART_URI=" not in kv:
+                    current["artwork"] = kv.split("ART_URI=", 1)[1].strip()
+                elif "DISPLAY_ICON_URI=" in kv and not current.get("artwork"):
+                    current["artwork"] = kv.split("DISPLAY_ICON_URI=", 1)[1].strip()
+                elif "MEDIA_URI=" in kv:
+                    current["media_uri"] = kv.split("MEDIA_URI=", 1)[1].strip()
         if current:
             sessions.append(current)
         if not sessions:
@@ -553,8 +656,53 @@ class ADBBridge:
         if not chosen.get("title") and not chosen.get("package"):
             return None
         chosen = dict(chosen)
+        chosen["artwork"] = self._resolve_media_artwork(chosen.get("artwork", ""))
         chosen["sessions"] = sessions
         return chosen
+
+    def _resolve_media_artwork(self, uri_or_path: str) -> str:
+        src = str(uri_or_path or "").strip().strip('"')
+        if not src:
+            return ""
+        if src.startswith("file://"):
+            src = src[7:]
+        if os.path.exists(src):
+            return src
+
+        cache_dir = os.path.join(tempfile.gettempdir(), "phonebridge-nowplaying")
+        os.makedirs(cache_dir, exist_ok=True)
+        ext = ".jpg"
+        low = src.lower()
+        for candidate in (".png", ".webp", ".jpeg", ".jpg"):
+            if low.endswith(candidate):
+                ext = candidate
+                break
+        out = os.path.join(cache_dir, f"{hashlib.sha1(src.encode('utf-8')).hexdigest()}{ext}")
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            return out
+
+        # Pull direct phone file paths when possible.
+        if src.startswith("/"):
+            ok, _ = self._run("pull", src, out, timeout=8)
+            if ok and os.path.exists(out) and os.path.getsize(out) > 0:
+                return out
+
+        # Try Android content provider path for content:// artwork URIs.
+        if src.startswith("content://"):
+            serial = self._resolve_target(allow_connect=True)
+            if serial:
+                ok, raw, _ = self._run_adb_bytes(
+                    "-s", serial, "shell", "content", "read", "--uri", src, timeout=8
+                )
+                if ok and raw:
+                    try:
+                        with open(out, "wb") as fh:
+                            fh.write(raw)
+                        if os.path.getsize(out) > 0:
+                            return out
+                    except Exception:
+                        pass
+        return ""
 
     def media_play_pause(self):
         return self._run("shell", "input", "keyevent", "KEYCODE_MEDIA_PLAY_PAUSE")[0]

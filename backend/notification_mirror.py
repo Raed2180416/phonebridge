@@ -1,6 +1,8 @@
 """Mirror phone notifications into desktop notification center with 2-way dismissal sync."""
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import subprocess
@@ -18,6 +20,18 @@ except Exception:  # pragma: no cover
 log = logging.getLogger(__name__)
 
 
+def _content_hash(payload: dict) -> str:
+    """Stable hash over the fields that affect desktop notification appearance."""
+    stable = {
+        "app": str(payload.get("app") or ""),
+        "title": str(payload.get("title") or ""),
+        "text": str(payload.get("text") or ""),
+        "actions": sorted(str(x) for x in (payload.get("actions") or [])),
+        "replyId": str(payload.get("replyId") or ""),
+    }
+    return hashlib.md5(json.dumps(stable, sort_keys=True).encode()).hexdigest()
+
+
 class NotificationMirror:
     def __init__(self):
         self._lock = threading.RLock()
@@ -27,6 +41,7 @@ class NotificationMirror:
         self._phone_to_desktop: dict[str, int] = {}
         self._desktop_to_phone: dict[int, str] = {}
         self._phone_payload: dict[str, dict] = {}
+        self._phone_hash: dict[str, str] = {}  # phone_id -> last posted content hash
         self._closing_desktop_ids: set[int] = set()
         self._kc = KDEConnect()
 
@@ -83,8 +98,12 @@ class NotificationMirror:
     def _upsert_one(self, phone_id: str, payload: dict) -> None:
         if self._iface is None:
             return
+        new_hash = _content_hash(payload)
         with self._lock:
             replace_id = int(self._phone_to_desktop.get(phone_id, 0) or 0)
+            # If this notification already has a desktop presence AND content unchanged, skip.
+            if replace_id and self._phone_hash.get(phone_id) == new_hash:
+                return
         summary = str(payload.get("title") or payload.get("app") or "Phone Notification")
         body = str(payload.get("text") or "")
         app_name = str(payload.get("app") or "Phone")
@@ -118,6 +137,7 @@ class NotificationMirror:
                 self._desktop_to_phone.pop(int(prev), None)
             self._phone_to_desktop[phone_id] = notif_id
             self._desktop_to_phone[notif_id] = phone_id
+            self._phone_hash[phone_id] = new_hash
             self._phone_payload[phone_id] = dict(payload or {})
 
     @staticmethod
@@ -158,6 +178,7 @@ class NotificationMirror:
                 return
             self._desktop_to_phone.pop(int(desktop_id), None)
             self._phone_payload.pop(str(phone_id), None)
+            self._phone_hash.pop(str(phone_id), None)
             self._closing_desktop_ids.add(int(desktop_id))
         try:
             self._iface.CloseNotification(dbus.UInt32(int(desktop_id)))
@@ -185,6 +206,7 @@ class NotificationMirror:
             if phone_id:
                 self._phone_to_desktop.pop(phone_id, None)
                 self._phone_payload.pop(phone_id, None)
+                self._phone_hash.pop(phone_id, None)
 
         if not phone_id:
             return

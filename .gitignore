@@ -21,6 +21,16 @@ dist/
 # Logs and misc
 *.log
 .DS_Store
+result
+pw_status.json
+
+# Local snapshots and generated evidence
+.rollback_snapshots/
+docs/audit/evidence/latest
+docs/audit/evidence/runs/
+
+# Hardware/local test outputs
+optional_tests/hardware_call_mic_report.json
 
 # Socket created by PhoneBridge
 /tmp/phonebridge-*.sock

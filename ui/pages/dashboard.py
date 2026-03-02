@@ -2,8 +2,9 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                               QLabel, QPushButton, QGridLayout, QFrame, QApplication, QListWidget, QListWidgetItem, QStyle, QMenu)
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QPropertyAnimation, QEasingCurve, QPoint, QSize
-from PyQt6.QtGui import QPainter, QColor, QPixmap, QIcon
+from PyQt6.QtGui import QPainter, QColor, QPixmap, QIcon, QPainterPath
 import time
+import os
 from ui.theme import (card_frame, lbl, pill, section_label, action_btn, input_field,
                       toggle_switch, divider, TEAL, CYAN, VIOLET, ROSE,
                       with_alpha,
@@ -55,17 +56,28 @@ class DashboardRefreshWorker(QThread):
             "signal_strength": None,
             "media": None,
             "tailscale": False,
+            "tailscale_local": False,
             "tailscale_ip": None,
+            "tailscale_mesh_reason": "",
             "kde_enabled": True,
             "kde_reachable": False,
+            "kde_status": "unknown",
             "syncthing": False,
+            "syncthing_service_active": False,
+            "syncthing_api_reachable": False,
+            "syncthing_reason": "unknown",
             "wifi_enabled": None,
             "bt_enabled": None,
         }
         kc = KDEConnect()
         adb = ADBBridge()
         try:
-            result["battery"] = kc.get_battery()
+            battery = kc.get_battery()
+            if not battery or int(battery.get("charge", -1)) < 0:
+                level = adb.get_battery_level()
+                if level >= 0:
+                    battery = {"charge": int(level), "is_charging": False, "source": "adb"}
+            result["battery"] = battery
         except Exception:
             result["battery"] = None
         try:
@@ -76,23 +88,52 @@ class DashboardRefreshWorker(QThread):
             result["signal_strength"] = None
         try:
             ts = Tailscale()
-            result["tailscale"] = bool(ts.is_connected())
-            if settings.get("tailscale_force_off", False) and result["tailscale"]:
+            snapshot = ts.get_mesh_snapshot(
+                phone_name=settings.get("device_name", ""),
+                phone_ip=settings.get("phone_tailscale_ip", ""),
+            )
+            result["tailscale_local"] = bool(snapshot.get("local_connected", False))
+            result["tailscale"] = bool(snapshot.get("mesh_ready", False))
+            result["tailscale_mesh_reason"] = str(snapshot.get("mesh_reason") or "")
+            if settings.get("tailscale_force_off", False) and result["tailscale_local"]:
                 ts.down()
-                result["tailscale"] = bool(ts.is_connected())
-            result["tailscale_ip"] = ts.get_self_ip()
+                snapshot = ts.get_mesh_snapshot(
+                    phone_name=settings.get("device_name", ""),
+                    phone_ip=settings.get("phone_tailscale_ip", ""),
+                )
+                result["tailscale_local"] = bool(snapshot.get("local_connected", False))
+                result["tailscale"] = bool(snapshot.get("mesh_ready", False))
+                result["tailscale_mesh_reason"] = str(snapshot.get("mesh_reason") or "")
+            result["tailscale_ip"] = snapshot.get("self_ip")
         except Exception:
             result["tailscale"] = False
+            result["tailscale_local"] = False
+            result["tailscale_mesh_reason"] = "tailscale status unavailable"
             result["tailscale_ip"] = None
         try:
             result["kde_enabled"] = bool(settings.get("kde_integration_enabled", True))
-            result["kde_reachable"] = bool(result["kde_enabled"] and kc.is_reachable())
+            _raw = kc.is_reachable() if result["kde_enabled"] else None
+            result["kde_reachable"] = _raw is True
+            result["kde_status"] = (
+                "disabled" if not result["kde_enabled"]
+                else "reachable" if _raw is True
+                else "unreachable" if _raw is False
+                else "unknown"
+            )
         except Exception:
             result["kde_enabled"] = bool(settings.get("kde_integration_enabled", True))
             result["kde_reachable"] = False
+            result["kde_status"] = "unknown"
         try:
-            result["syncthing"] = bool(Syncthing().is_running())
+            st_status = Syncthing().get_runtime_status(timeout=3)
+            result["syncthing_service_active"] = bool(st_status.get("service_active", False))
+            result["syncthing_api_reachable"] = bool(st_status.get("api_reachable", False))
+            result["syncthing_reason"] = str(st_status.get("reason") or "unknown")
+            result["syncthing"] = bool(st_status.get("service_active", False))
         except Exception:
+            result["syncthing_service_active"] = False
+            result["syncthing_api_reachable"] = False
+            result["syncthing_reason"] = "status_unavailable"
             result["syncthing"] = False
         try:
             result["wifi_enabled"] = adb.get_wifi_enabled()
@@ -133,6 +174,8 @@ class ToggleActionWorker(QThread):
 
 
 class DashboardPage(QWidget):
+    _EMPTY_MEDIA_TEXT = "Nothing playing right now. Play something to see it."
+
     def __init__(self):
         super().__init__()
         self.setStyleSheet("background:transparent;")
@@ -203,8 +246,8 @@ class DashboardPage(QWidget):
         """)
         info = QVBoxLayout()
         info.setSpacing(3)
-        self._device_name_lbl = lbl("Nothing Phone 3a Pro", 20, TEXT, bold=True)
-        self._device_sub_lbl  = lbl("100.127.0.90 · tailnet · KDE Connect live",
+        self._device_name_lbl = lbl("Phone", 20, TEXT, bold=True)
+        self._device_sub_lbl  = lbl("tailnet · KDE Connect",
                                     10, TEXT_DIM, mono=True)
         info.addWidget(self._device_name_lbl)
         info.addWidget(self._device_sub_lbl)
@@ -270,10 +313,30 @@ class DashboardPage(QWidget):
         np_head.addWidget(self._player_switch_btn)
         npl.addLayout(np_head)
 
-        self._np_title = lbl("Nothing playing right now", 14, bold=True)
-        self._np_sub = lbl("Playback sessions from phone apps appear here", 11, TEXT_DIM)
-        npl.addWidget(self._np_title)
-        npl.addWidget(self._np_sub)
+        np_body = QHBoxLayout()
+        np_body.setSpacing(12)
+        self._np_art = QLabel("♪")
+        self._np_art.setFixedSize(56, 56)
+        self._np_art.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._np_art.setStyleSheet(f"""
+            QLabel {{
+                background: rgba(255,255,255,0.05);
+                border: 1px solid rgba(255,255,255,0.14);
+                border-radius: 14px;
+                color: {TEXT_DIM};
+                font-size: 20px;
+                font-weight: 700;
+            }}
+        """)
+        np_text = QVBoxLayout()
+        np_text.setSpacing(3)
+        self._np_title = lbl(self._EMPTY_MEDIA_TEXT, 14, bold=True)
+        self._np_sub = lbl("", 11, TEXT_DIM)
+        np_text.addWidget(self._np_title)
+        np_text.addWidget(self._np_sub)
+        np_body.addWidget(self._np_art, 0, Qt.AlignmentFlag.AlignTop)
+        np_body.addLayout(np_text, 1)
+        npl.addLayout(np_body)
 
         np_ctrl = QHBoxLayout()
         np_ctrl.setSpacing(8)
@@ -376,7 +439,7 @@ class DashboardPage(QWidget):
         cl.addWidget(self._bt_row)
         cl.addWidget(divider())
         self._hs_row = self._conn_row("📡","Mobile Hotspot",
-                                    "Off · toggle via ADB", False, CYAN,
+                                    "Auto: USB tether (if wired) else Wi-Fi hotspot", False, CYAN,
                                     on_toggle=self._hotspot)
         cl.addWidget(self._hs_row)
         layout.addWidget(conn_frame)
@@ -448,6 +511,80 @@ class DashboardPage(QWidget):
         self._play_is_playing = state in {"playing", "active"}
         if hasattr(self, "_play_btn") and self._play_btn is not None:
             self._set_media_button_icon(self._play_btn, "pause" if self._play_is_playing else "play")
+
+    def _is_valid_media_session(self, media: dict) -> bool:
+        if not isinstance(media, dict):
+            return False
+        title = str(media.get("title") or "").strip()
+        artist = str(media.get("artist") or "").strip()
+        album = str(media.get("album") or "").strip()
+        if not (title or artist or album):
+            return False
+        if title.lower() in {"media", "bluetooth", "unknown"} and not (artist or album):
+            return False
+        return True
+
+    def _pick_display_media(self, current: dict, sessions: list):
+        valid = [s for s in (sessions or []) if self._is_valid_media_session(s)]
+        if not valid:
+            return None, []
+        preferred = str(self._active_media_pkg_pref or "").strip()
+        if preferred:
+            for session in valid:
+                if str(session.get("package") or "").strip() == preferred:
+                    return session, valid
+        if self._is_valid_media_session(current):
+            return current, valid
+        active = [s for s in valid if str(s.get("state") or "").strip().lower() in {"playing", "active"}]
+        return (active[0] if active else valid[0]), valid
+
+    def _rounded_pixmap(self, pixmap: QPixmap, edge: int = 56, radius: int = 14) -> QPixmap:
+        if pixmap.isNull():
+            return QPixmap()
+        scaled = pixmap.scaled(edge, edge, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+        out = QPixmap(edge, edge)
+        out.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(out)
+        path = QPainterPath()
+        path.addRoundedRect(0, 0, edge, edge, radius, radius)
+        painter.setClipPath(path)
+        painter.drawPixmap(0, 0, scaled)
+        painter.end()
+        return out
+
+    def _set_now_playing_artwork(self, media: dict | None):
+        art_path = ""
+        if isinstance(media, dict):
+            for key in ("artwork", "art", "album_art", "art_path", "cover_path"):
+                val = str(media.get(key) or "").strip()
+                if val and os.path.exists(val):
+                    art_path = val
+                    break
+        if art_path:
+            pix = QPixmap(art_path)
+            rounded = self._rounded_pixmap(pix)
+            if not rounded.isNull():
+                self._np_art.setText("")
+                self._np_art.setPixmap(rounded)
+                self._np_art.setStyleSheet("""
+                    QLabel {
+                        background: transparent;
+                        border: none;
+                    }
+                """)
+                return
+        self._np_art.setPixmap(QPixmap())
+        self._np_art.setText("♪")
+        self._np_art.setStyleSheet(f"""
+            QLabel {{
+                background: rgba(255,255,255,0.05);
+                border: 1px solid rgba(255,255,255,0.14);
+                border-radius: 14px;
+                color: {TEXT_DIM};
+                font-size: 20px;
+                font-weight: 700;
+            }}
+        """)
 
     def _stat(self, label_text, val, color, sub):
         f = card_frame(hover=False)
@@ -533,6 +670,7 @@ class DashboardPage(QWidget):
         state_map = {
             "connected": (TEXT_MID, "Connected"),
             "connecting": (TEXT_DIM, "Checking"),
+            "degraded": (AMBER, "Degraded"),
             "disconnected": (TEXT_DIM, "Offline"),
         }
         color, suffix = state_map.get(state_name, state_map["disconnected"])
@@ -627,10 +765,15 @@ class DashboardPage(QWidget):
     def _apply_refresh(self, data, include_media=False):
         self._refresh_busy = False
         tailscale_on = bool((data or {}).get("tailscale", False))
+        tailscale_local_on = bool((data or {}).get("tailscale_local", tailscale_on))
         tailscale_ip = (data or {}).get("tailscale_ip") or "offline"
+        tailscale_reason = str((data or {}).get("tailscale_mesh_reason") or "").strip()
         kde_enabled = bool((data or {}).get("kde_enabled", True))
         kde_reachable = bool((data or {}).get("kde_reachable", False))
-        syncthing_on = bool((data or {}).get("syncthing", False))
+        kde_status = str((data or {}).get("kde_status") or ("reachable" if kde_reachable else ("disabled" if not kde_enabled else "unreachable")))
+        syncthing_service_active = bool((data or {}).get("syncthing_service_active", False))
+        syncthing_api_reachable = bool((data or {}).get("syncthing_api_reachable", False))
+        syncthing_reason = str((data or {}).get("syncthing_reason") or "unknown")
 
         self._set_status_pill(
             self._ts_pill,
@@ -640,17 +783,34 @@ class DashboardPage(QWidget):
         self._set_status_pill(
             self._kde_pill,
             "KDE Connect",
-            "connected" if (kde_enabled and kde_reachable) else ("disconnected" if not kde_enabled else "connecting"),
+            "connected" if kde_status == "reachable"
+            else "disconnected" if kde_status == "disabled"
+            else "degraded" if kde_status == "unknown"
+            else "connecting",
         )
         self._set_status_pill(
             self._sync_pill,
             "Syncthing",
-            "connected" if syncthing_on else "disconnected",
+            "connected" if (syncthing_service_active and syncthing_api_reachable)
+            else "degraded" if (syncthing_service_active or syncthing_api_reachable)
+            else "disconnected",
         )
+        tailscale_detail = tailscale_ip
+        if tailscale_local_on and not tailscale_on and tailscale_reason:
+            tailscale_detail = f"{tailscale_ip} ({tailscale_reason})"
+        _kde_label = {
+            "reachable": "reachable",
+            "unreachable": "offline",
+            "disabled": "disabled",
+            "unknown": "unknown",
+        }.get(kde_status, "unknown")
         self._device_sub_lbl.setText(
-            f"{tailscale_ip} · KDE {'reachable' if kde_reachable else ('disabled' if not kde_enabled else 'offline')} · "
-            f"Syncthing {'running' if syncthing_on else 'stopped'}"
+            f"{tailscale_detail} · KDE {_kde_label} · "
+            f"Syncthing S:{'on' if syncthing_service_active else 'off'} A:{'up' if syncthing_api_reachable else 'down'}"
         )
+
+        if syncthing_service_active and (not syncthing_api_reachable):
+            self._net_card[2].setText(f"Syncthing API degraded ({syncthing_reason})")
 
         bat = (data or {}).get("battery") or {}
         if bat and bat.get("charge", -1) >= 0:
@@ -658,9 +818,17 @@ class DashboardPage(QWidget):
             is_charging = bool(bat.get("is_charging"))
             suffix = " ⚡" if is_charging else "%"
             self._bat_card[1].setText(f"{charge}{suffix}")
-            self._bat_card[2].setText("Charging" if is_charging else "On battery")
+            source = str(bat.get("source") or "kde")
+            if source == "adb":
+                self._bat_card[2].setText("On battery (via ADB)")
+            else:
+                self._bat_card[2].setText("Charging" if is_charging else "On battery")
             w = int(charge * self._bat_card[0].width() / 100) if self._bat_card[0].width() > 0 else 60
             self._bat_card[3].setFixedWidth(max(2, w))
+        else:
+            self._bat_card[1].setText("—")
+            self._bat_card[2].setText("Unavailable")
+            self._bat_card[3].setFixedWidth(8)
 
         net = (data or {}).get("network_type")
         strength = (data or {}).get("signal_strength")
@@ -686,7 +854,9 @@ class DashboardPage(QWidget):
             self._last_media_refresh = time.time()
             media = (data or {}).get("media")
             if media:
-                self._media_sessions = list(media.get("sessions") or [])
+                sessions = list(media.get("sessions") or [])
+                media, self._media_sessions = self._pick_display_media(media, sessions)
+            if media:
                 if self._active_media_pkg_pref:
                     found = any(
                         (s.get("package") or "") == self._active_media_pkg_pref for s in self._media_sessions
@@ -701,13 +871,15 @@ class DashboardPage(QWidget):
                 media_state = (media.get("state") or "unknown").replace("_", " ")
                 self._np_title.setText(title)
                 self._np_sub.setText(f"{artist} · {media_state}")
+                self._set_now_playing_artwork(media)
                 self._set_play_toggle_icon(media.get("state") or "")
                 self._sync_player_switch_button()
             else:
                 self._now_playing_pkg = ""
                 self._media_sessions = []
-                self._np_title.setText("Nothing playing right now")
-                self._np_sub.setText("Playback sessions from phone apps appear here")
+                self._np_title.setText(self._EMPTY_MEDIA_TEXT)
+                self._np_sub.setText("")
+                self._set_now_playing_artwork(None)
                 self._set_play_toggle_icon("paused")
                 self._sync_player_switch_button()
 
@@ -723,8 +895,12 @@ class DashboardPage(QWidget):
         self.adb.lock_phone()
 
     def _hotspot(self, checked=True):
-        if not self.adb.set_hotspot(bool(checked)) and checked:
-            self.adb.open_hotspot_settings()
+        target = bool(checked)
+
+        def _action():
+            return self.adb.set_hotspot_smart(target)
+
+        self._run_toggle(self._hs_row, _action, "Hotspot toggle failed")
 
     def _view_clipboard(self):
         """Show synced phone clipboard timeline with search and source labels."""

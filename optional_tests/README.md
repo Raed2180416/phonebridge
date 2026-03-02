@@ -6,6 +6,9 @@ Contents:
 - `test_audio_route_state_machine.py`: deterministic pytest coverage for call/audio route transitions (including call-mic profile gating).
 - `test_outbound_popup_suppression.py`: deterministic pytest coverage for outbound-call popup suppression + cleanup behavior.
 - `test_call_mic_activation_transition.py`: deterministic pytest coverage for pending -> active call-mic transition retry logic.
+- `test_kde_watchdog.py`: deterministic pytest coverage for KDE watchdog debounce/cooldown + Tailscale/ADB gate checks.
+- `test_kde_phone_commands.py`: deterministic pytest coverage for KDE command-pack installer + phone-triggered host action handlers.
+- `test_tailscale_mesh_status.py`: deterministic pytest coverage for mesh snapshot semantics (local online, phone peer presence, mesh-ready decision).
 - `hardware_call_mic_harness.py`: scripted environment + route verification harness for real hardware checks.
 
 Run deterministic tests:

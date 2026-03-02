@@ -5,6 +5,7 @@ import subprocess
 import logging
 import os
 import signal
+import threading
 import time
 from dataclasses import dataclass
 
@@ -20,6 +21,52 @@ _sources = {
     "ui_global_toggle": bool(settings.get("audio_redirect", False)),
     "call_pc_active": False,
 }
+
+# ── BT call mic-path watchdog ─────────────────────────────────────────────────
+# Runs while call_audio_active=True.  If the mic path drops mid-call, it
+# re-triggers sync_result() to re-establish or surface the failure.
+_WATCHDOG_INTERVAL_S = 5.0
+_watchdog_thread: threading.Thread | None = None
+_watchdog_stop = threading.Event()
+
+
+def _start_call_route_watchdog() -> None:
+    """Start BT mic-path health watchdog.  No-op if already running."""
+    global _watchdog_thread
+    _watchdog_stop.clear()
+    if _watchdog_thread is not None and _watchdog_thread.is_alive():
+        return
+    t = threading.Thread(target=_call_route_watchdog_loop, name="pb-bt-watchdog", daemon=True)
+    _watchdog_thread = t
+    t.start()
+    log.debug("BT call-route watchdog started")
+
+
+def _stop_call_route_watchdog() -> None:
+    """Signal watchdog to stop; does not block."""
+    _watchdog_stop.set()
+    log.debug("BT call-route watchdog stop requested")
+
+
+def _call_route_watchdog_loop() -> None:
+    """Background loop: if mic path drops while call active, re-trigger sync."""
+    while not _watchdog_stop.wait(_WATCHDOG_INTERVAL_S):
+        if not bool(state.get("call_audio_active", False)):
+            # Route no longer active — exit watchdog cleanly.
+            log.debug("BT watchdog: call_audio_active=False, exiting")
+            return
+        if not _bt_call_mic_path_active():
+            log.warning("BT watchdog: call mic path dropped mid-call; attempting re-sync")
+            try:
+                result = sync_result(call_retry_ms=4000, retry_step_ms=300, suspend_ui_global=True)
+                if result.ok:
+                    log.info("BT watchdog: mic path restored (backend=%s)", result.backend)
+                else:
+                    log.warning("BT watchdog: re-sync failed (status=%s, reason=%s)",
+                                result.status, result.reason)
+            except Exception:
+                log.exception("BT watchdog: re-sync raised exception")
+    log.debug("BT call-route watchdog stopped")
 
 
 @dataclass
@@ -520,6 +567,7 @@ def _call_route_active_result(reason: str = "Bluetooth call mic path is active")
     backend = active_backend()
     state.set("call_audio_active", True)
     _set_call_route_state("pc_active", "Audio on laptop/PC", backend)
+    _start_call_route_watchdog()  # monitor mic path while call is active
     return RouteSyncResult(
         ok=True,
         status="active",
@@ -543,6 +591,7 @@ def _call_route_pending_result(reason: str = "Waiting for Bluetooth call mic pat
 
 def _call_route_failed_result(reason: str) -> RouteSyncResult:
     state.set("call_audio_active", False)
+    _stop_call_route_watchdog()
     _set_call_route_state("pc_failed", reason, "none")
     return RouteSyncResult(
         ok=False,
@@ -571,6 +620,7 @@ def sync_result(
             if end_call_session:
                 _restore_call_audio_session_if_needed()
             if not bool(_sources.get("call_pc_active", False)):
+                _stop_call_route_watchdog()
                 state.set("call_audio_active", False)
             return RouteSyncResult(
                 ok=True,
@@ -584,6 +634,7 @@ def sync_result(
             if end_call_session:
                 _restore_call_audio_session_if_needed()
             if not bool(_sources.get("call_pc_active", False)):
+                _stop_call_route_watchdog()
                 state.set("call_audio_active", False)
             return RouteSyncResult(
                 ok=True,
@@ -653,6 +704,7 @@ def start(adb: ADBBridge | None = None) -> bool:
 
 
 def stop() -> bool:
+    _stop_call_route_watchdog()
     ok = _stop_proc()
     _restore_call_audio_session_if_needed()
     _enforce_call_ready_bt_mode()

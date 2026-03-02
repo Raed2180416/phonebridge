@@ -10,7 +10,7 @@ import dbus.mainloop.glib
 from gi.repository import GLib
 from backend.settings_store import get as setting
 
-DEVICE_ID = "a9fe30c209da40d4bddce484a2c4112a"
+DEVICE_ID = str(os.environ.get("PHONEBRIDGE_DEVICE_ID", "") or "").strip()
 BUS_NAME  = "org.kde.kdeconnect"
 log = logging.getLogger(__name__)
 
@@ -102,6 +102,7 @@ class KDEConnect:
     #          allNotificationsRemoved()
     def get_notifications(self):
         try:
+            import time as _time
             iface = self._iface(self._dev("notifications"),
                                 "org.kde.kdeconnect.device.notifications")
             ids = iface.activeNotifications(timeout=3)
@@ -136,12 +137,14 @@ class KDEConnect:
                         "dismissable": bool(_get_prop("dismissable", True)),
                         "replyId":     str(_get_prop("replyId", "") or ""),
                         "actions":     list(_get_prop("actions", []) or []),
+                        "time_ms":     int(_time.time() * 1000),
                     })
                 except Exception as e2:
                     log.warning("Notification property read failed %s: %s", nid, e2)
                     result.append({"id": str(nid), "app": "App", "title": "Notification",
                                    "text": "", "dismissable": True,
-                                   "replyId": "", "actions": []})
+                                   "replyId": "", "actions": [],
+                                   "time_ms": int(_time.time() * 1000)})
             return result
         except Exception as e:
             log.warning("Notifications fetch failed: %s", e)
@@ -597,13 +600,22 @@ class KDEConnect:
             return False
 
     # ── Device reachability ────────────────────────────────────
-    def is_reachable(self):
+    def is_reachable(self) -> bool | None:
+        """Return True if device reachable, False if not, None if D-Bus unavailable."""
         try:
-            obj   = self._obj(self._dev())
-            props = dbus.Interface(obj, "org.freedesktop.DBus.Properties")
-            return bool(props.Get("org.kde.kdeconnect.device", "isReachable"))
-        except:
-            return True  # assume reachable if can't check
+            daemon_obj = self.bus.get_object(BUS_NAME, "/modules/kdeconnect", introspect=False)
+            daemon = dbus.Interface(daemon_obj, "org.kde.kdeconnect.daemon")
+            # Reachable + paired devices from kdeconnectd itself.
+            reachable = list(daemon.devices(True, True) or [])
+            if not reachable:
+                return False
+            target_id = str(self.device_id or "").strip()
+            if not target_id:
+                return True
+            return target_id in {str(x) for x in reachable}
+        except Exception:
+            # Return None so callers can surface Unknown instead of false-negative Unreachable.
+            return None
 
     def get_device_name(self):
         try:
@@ -611,4 +623,92 @@ class KDEConnect:
             props = dbus.Interface(obj, "org.freedesktop.DBus.Properties")
             return str(props.Get("org.kde.kdeconnect.device", "name"))
         except:
-            return "Nothing Phone 3a Pro"
+            return str(setting("device_name", "Phone") or "Phone")
+
+
+# ── Module-level helpers for in-app health / watchdog ────────────────────────
+
+def trigger_refresh() -> bool:
+    """Run `kdeconnect-cli --refresh` and return True if it exited 0.
+
+    Non-blocking wrapper; used by the in-app health probe before re-checking
+    reachability.  Returns False on timeout or non-zero exit.
+    """
+    try:
+        res = subprocess.run(
+            ["kdeconnect-cli", "--refresh"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        ok = res.returncode == 0
+        if not ok:
+            log.debug("kdeconnect-cli --refresh rc=%s stderr=%s", res.returncode, (res.stderr or "").strip()[:200])
+        return ok
+    except Exception as exc:
+        log.debug("kdeconnect-cli --refresh raised: %s", exc)
+        return False
+
+
+def kde_health_probe(device_id: str = "") -> dict:
+    """One-shot health check: returns a dict suitable for state['kde_health'].
+
+    Keys:
+        status:       "ok" | "degraded" | "unknown"
+        reachable:    True | False | None   (None = D-Bus unavailable)
+        refresh_ok:   True | False | None   (None = not attempted)
+        checked_at:   int epoch-ms
+        device_id:    str device_id used for check
+
+    When device is not reachable, trigger_refresh() is called once and
+    reachability is re-probed.  The refresh attempt result is stored in
+    refresh_ok.  The final status is based on the second probe.
+    """
+    import time as _time
+
+    _did = str(device_id or setting("device_id", DEVICE_ID) or "").strip()
+    try:
+        kc = KDEConnect()
+        if _did:
+            kc.device_id = _did
+        first_check = kc.is_reachable()
+    except Exception as exc:
+        log.debug("kde_health_probe: KDEConnect() failed: %s", exc)
+        first_check = None
+
+    if first_check is True:
+        return {
+            "status": "ok",
+            "reachable": True,
+            "refresh_ok": None,
+            "checked_at": int(_time.time() * 1000),
+            "device_id": _did,
+        }
+
+    # Not reachable or D-Bus unavailable — attempt a refresh then re-probe.
+    refresh_ok = trigger_refresh()
+
+    try:
+        kc2 = KDEConnect()
+        if _did:
+            kc2.device_id = _did
+        second_check = kc2.is_reachable()
+    except Exception:
+        second_check = None
+
+    if second_check is True:
+        status = "ok"
+    elif second_check is None or first_check is None:
+        status = "unknown"
+    else:
+        status = "degraded"
+
+    return {
+        "status": status,
+        "reachable": second_check,
+        "refresh_ok": refresh_ok,
+        "checked_at": int(_time.time() * 1000),
+        "device_id": _did,
+    }
+

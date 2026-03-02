@@ -5,6 +5,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_PY="$ROOT_DIR/.venv/bin/python"
 
+SELF_CHECK=0
+if [[ "${1:-}" == "--self-check" ]]; then
+  SELF_CHECK=1
+  shift
+fi
+
 if [[ ! -x "$VENV_PY" ]]; then
   echo "Missing venv python: $VENV_PY" >&2
   exit 1
@@ -15,12 +21,36 @@ if ! command -v steam-run >/dev/null 2>&1; then
   exit 1
 fi
 
-SYSTEM_PY="/etc/profiles/per-user/${USER}/bin/python"
-if [[ ! -x "$SYSTEM_PY" ]]; then
-  SYSTEM_PY="/etc/profiles/per-user/raed/bin/python"
+declare -a PY_CANDIDATES=(
+  "/etc/profiles/per-user/${USER}/bin/python"
+  "/etc/profiles/per-user/${USER}/bin/python3"
+  "/run/current-system/sw/bin/python3"
+  "/nix/var/nix/profiles/default/bin/python3"
+)
+
+if command -v python3 >/dev/null 2>&1; then
+  PY_CANDIDATES+=("$(command -v python3)")
 fi
-if [[ ! -x "$SYSTEM_PY" ]]; then
-  echo "Could not find system python for dbus site-packages lookup." >&2
+if command -v python >/dev/null 2>&1; then
+  PY_CANDIDATES+=("$(command -v python)")
+fi
+
+SYSTEM_PY=""
+for cand in "${PY_CANDIDATES[@]}"; do
+  if [[ -x "$cand" ]]; then
+    SYSTEM_PY="$cand"
+    break
+  fi
+done
+
+if [[ -z "$SYSTEM_PY" ]]; then
+  {
+    echo "Could not find a system python interpreter for dbus site-packages lookup."
+    echo "Checked candidates:"
+    for cand in "${PY_CANDIDATES[@]}"; do
+      echo "  - $cand"
+    done
+  } >&2
   exit 1
 fi
 
@@ -32,4 +62,13 @@ PY
 )"
 
 export PYTHONPATH="$SYS_SITE${PYTHONPATH:+:$PYTHONPATH}"
+
+if [[ "$SELF_CHECK" -eq 1 ]]; then
+  echo "VENV_PY=$VENV_PY"
+  echo "SYSTEM_PY=$SYSTEM_PY"
+  echo "SYS_SITE=$SYS_SITE"
+  echo "PYTHONPATH=$PYTHONPATH"
+  exit 0
+fi
+
 exec steam-run "$VENV_PY" "$ROOT_DIR/main.py" "$@"

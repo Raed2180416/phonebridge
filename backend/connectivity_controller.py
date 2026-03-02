@@ -262,10 +262,25 @@ def set_syncthing(enabled: bool):
         desired = bool(enabled)
         st = Syncthing()
         cmd_ok = bool(st.set_running(desired))
-        actual_ok, actual = _wait_for_bool(st.is_running, desired, timeout_s=4.0, step_s=0.4)
+        actual_ok, actual = _wait_for_bool(st.is_service_active, desired, timeout_s=4.0, step_s=0.4)
+        status = st.get_runtime_status(timeout=3)
         if not actual_ok:
-            return False, "Syncthing service did not reach requested state", actual
-        return True, ("Syncthing running" if desired else "Syncthing stopped"), actual
+            return (
+                False,
+                f"Syncthing service did not reach requested state ({status.get('unit_state', 'unknown')})",
+                bool(status.get("service_active", False)),
+            )
+        if desired and not bool(status.get("api_reachable", False)):
+            return (
+                bool(cmd_ok),
+                f"Syncthing service active; API unreachable ({status.get('api_reason', 'unknown')})",
+                True,
+            )
+        return (
+            bool(cmd_ok),
+            ("Syncthing service active" if desired else "Syncthing service stopped"),
+            bool(status.get("service_active", False)),
+        )
     finally:
         _end("syncthing", lock)
 

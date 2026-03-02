@@ -413,11 +413,12 @@ class MirrorPage(QWidget):
         self._start_main_stream()
 
     def _ensure_prereqs(self, *, skip_connectivity=False):
-        if not shutil.which("adb"):
-            self._set_status("ADB is not installed", "error")
+        from backend import preflight
+        if not preflight.has("adb"):
+            self._set_status(preflight.missing_text("adb"), "error")
             return False
-        if not shutil.which("scrcpy"):
-            self._set_status("scrcpy is not installed", "error")
+        if not preflight.has("mirror"):
+            self._set_status(preflight.missing_text("mirror"), "error")
             return False
 
         if not skip_connectivity:
