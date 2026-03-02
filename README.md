@@ -249,7 +249,7 @@ ui/                        # Qt UI components, themes and pages
 run-venv-nix.sh            # NixOS compatibility wrapper for venv launches
 docs/PHONEBRIDGE_DEEP_DIVE.md  # Architectural and feature walkthrough
 ```
-
+edit: there is no partner mobile app that I developed, you just use the official kde connect app. you configure syncthing and tailscale on your phone and enable wireless and wired usb debugging, the app handles both, prefers wired channel whenever available. to get the call audio routing through your machine, you might need to tinker around on advanced bluetooth settings on your device. this feature is extremely fragile, flaky and not promised for every device. it works on my system tho 
 ---
 
 # 📜 License
