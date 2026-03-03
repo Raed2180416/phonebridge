@@ -8,11 +8,31 @@ import httpx
 import backend.settings_store as settings
 
 
+def _read_key_from_syncthing_config() -> str:
+    """Read the API key directly from ~/.config/syncthing/config.xml as fallback."""
+    import xml.etree.ElementTree as ET
+    config_path = os.path.expanduser("~/.config/syncthing/config.xml")
+    try:
+        tree = ET.parse(config_path)
+        el = tree.find(".//apikey")
+        if el is not None and el.text:
+            return el.text.strip()
+    except Exception:
+        pass
+    return ""
+
+
 def resolve_syncthing_config():
     url = str(settings.get("syncthing_url", "http://127.0.0.1:8384") or "").strip()
     key = str(settings.get("syncthing_api_key", "") or "").strip()
     if not url:
         url = "http://127.0.0.1:8384"
+    if not key:
+        # Auto-discover from Syncthing's own config and persist it so future
+        # calls don't need to re-parse config.xml.
+        key = _read_key_from_syncthing_config()
+        if key:
+            settings.set("syncthing_api_key", key)
     return url.rstrip("/"), key
 
 
