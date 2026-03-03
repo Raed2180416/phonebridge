@@ -570,6 +570,27 @@ class DashboardPage(QWidget):
         painter.end()
         return out
 
+    def _placeholder_media_art(self, media: dict | None, edge: int = 56, radius: int = 18) -> QPixmap:
+        out = QPixmap(edge, edge)
+        out.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(out)
+        path = QPainterPath()
+        path.addRoundedRect(0, 0, edge, edge, radius, radius)
+        painter.setClipPath(path)
+        base = QColor(30, 42, 68)
+        accent = QColor(86, 112, 176)
+        painter.fillRect(0, 0, edge, edge, base)
+        painter.fillRect(0, int(edge * 0.55), edge, int(edge * 0.45), accent)
+        painter.setPen(QColor(220, 228, 245))
+        marker = "▶"
+        if isinstance(media, dict):
+            title = str(media.get("title") or "").strip()
+            if title:
+                marker = title[0].upper()
+        painter.drawText(out.rect(), Qt.AlignmentFlag.AlignCenter, marker)
+        painter.end()
+        return out
+
     def _set_now_playing_artwork(self, media: dict | None):
         art_path = ""
         if isinstance(media, dict):
@@ -591,6 +612,16 @@ class DashboardPage(QWidget):
                     }
                 """)
                 return
+        if isinstance(media, dict) and (media.get("title") or media.get("package") or media.get("session_name")):
+            self._np_art.setText("")
+            self._np_art.setPixmap(self._placeholder_media_art(media))
+            self._np_art.setStyleSheet("""
+                QLabel {
+                    background: transparent;
+                    border: none;
+                }
+            """)
+            return
         self._np_art.setPixmap(QPixmap())
         self._np_art.setText("♪")
         self._np_art.setStyleSheet(f"""

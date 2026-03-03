@@ -137,7 +137,9 @@ Dependencies:
 Fallback/retry behavior:
 - Handles missing/failed reads by returning safe defaults (`None`/falsey states).
 - Fallback network type hints through ADB if KDE network type unavailable.
-- Now Playing artwork uses media-session metadata URI extraction via ADB; if URI cannot be resolved, UI falls back to icon art.
+- Now Playing artwork resolves metadata for all sessions (including switched player sessions), using URI/path extraction via ADB.
+- If source app does not expose artwork URI/path, dashboard renders a rounded squircle placeholder tile instead of blank art.
+- Syncthing mixed-state handling treats API-reachable external instances as connected and throttles service auto-start attempts for recoverable inactive states.
 
 Failure/recovery:
 - Toggle worker returns result tuple and UI surfaces warning/success toast.
@@ -292,7 +294,8 @@ Dependencies:
 - Syncthing REST endpoints (`/rest/config`, `/rest/db/status`, `/rest/system/connections`).
 
 Fallback/retry:
-- If Syncthing not running, explicit service-warning state.
+- Service/API are treated separately; API-reachable external/manual Syncthing instances are treated as usable.
+- Recoverable inactive states trigger throttled auto-start attempts (skipped when unit is masked).
 - Failed path updates keep control in retry mode.
 
 Failure/recovery:

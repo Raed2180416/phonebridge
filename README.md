@@ -80,6 +80,11 @@ Maintenance is best-effort.
   View current media sessions and control playback.  
   If multiple players are active, choose which one to control.
 
+- **Now Playing artwork behavior**
+  - Attempts to resolve album/video art from Android media metadata (URI/path)
+  - If artwork is not exposed by the source app, shows a rounded squircle placeholder tile
+  - Session switcher keeps per-session artwork resolved where available
+
 - **Clipboard sharing**  
   Sync phone clipboard events to desktop, with optional auto-share and history sanitization.
 
@@ -106,6 +111,10 @@ Maintenance is best-effort.
 
 - **Syncthing status & control**  
   Monitor sync progress for each folder, pause/resume transfers and change local storage paths.
+  Runtime status is service/API-split aware:
+  - Service active + API reachable = connected
+  - Service inactive + API reachable (external/manual Syncthing) = connected with external-instance note
+  - Recoverable inactive states trigger throttled auto-start attempts.
 
 - **File transfer**  
   Send files from your laptop to your phone via KDE Connect and add new folders for automatic syncing.
@@ -159,6 +168,7 @@ Maintenance is best-effort.
 
 - **Hyprland keybind**  
   Toggle the PhoneBridge panel with a managed Hyprland bind (`SUPER+P`) when opt-in is enabled.
+  The keybind path uses a fast local IPC relay script (`scripts/phonebridge-toggle.sh`) so toggling does not spawn a full runtime sandbox on every keypress.
 
 - **Startup integration writes are opt-in (default: off)**
   - Manage App Icon
@@ -194,18 +204,18 @@ PhoneBridge is designed around a specific environment (NixOS + Hyprland).
 
 ### Per-feature requirements and failure modes
 
-| Feature            | Requires                                              | Failure mode                                                                  |
-| ------------------ | ----------------------------------------------------- | ----------------------------------------------------------------------------- |
-| Screen mirror      | `scrcpy`, `adb`                                       | Mirror page shows explicit missing-tool message                               |
-| Call audio routing | `pactl` or `wpctl` + `pw-dump`                        | Route silently unavailable; startup warns once                                |
-| Video thumbnails   | `ffmpegthumbnailer` or `ffmpeg`                       | File browser shows icon fallback (no crash)                                   |
-| Notification copy  | `wl-copy` (Wayland) or `xclip` (X11)                  | Copy action silently dropped                                                  |
-| Bluetooth toggles  | `bluetoothctl`                                        | Bluetooth page controls unavailable                                           |
-| KDE Connect bridge | D-Bus session + `kdeconnectd`                         | Reachability shows **Unknown** (not false-positive Reachable)                 |
-| Syncthing sync     | `syncthing` service + API key in config               | Sync page shows deterministic service/API split status                        |
-| Tailscale mesh     | `tailscale` CLI                                       | Mesh status shows offline; toggles disabled                                   |
-| Hotspot            | `adb` + Android `cmd wifi start-softap` or `svc wifi` | Hotspot toggle falls back between command families                            |
-| Startup writes     | All opt-in; disabled by default                       | Fresh installs do not mutate `~/.config/hypr`, `~/.local/share`, or autostart |
+| Feature            | Requires                                                                     | Failure mode                                                                      |
+| ------------------ | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Screen mirror      | `scrcpy`, `adb`                                                              | Mirror page shows explicit missing-tool message                                   |
+| Call audio routing | `pactl` or `wpctl` + `pw-dump`                                               | Route silently unavailable; startup warns once                                    |
+| Video thumbnails   | `ffmpegthumbnailer` or `ffmpeg`                                              | File browser shows icon fallback (no crash)                                       |
+| Notification copy  | `wl-copy` (Wayland) or `xclip` (X11)                                         | Copy action silently dropped                                                      |
+| Bluetooth toggles  | `bluetoothctl`                                                               | Bluetooth page controls unavailable                                               |
+| KDE Connect bridge | D-Bus session + `kdeconnectd`                                                | Reachability shows **Unknown** (not false-positive Reachable)                     |
+| Syncthing sync     | Syncthing API reachable (`syncthing` service or external instance) + API key | Dashboard/Sync pages apply service/API split semantics and auto-recovery attempts |
+| Tailscale mesh     | `tailscale` CLI                                                              | Mesh status shows offline; toggles disabled                                       |
+| Hotspot            | `adb` + Android `cmd wifi start-softap` or `svc wifi`                        | Hotspot toggle falls back between command families                                |
+| Startup writes     | All opt-in; disabled by default                                              | Fresh installs do not mutate `~/.config/hypr`, `~/.local/share`, or autostart     |
 
 Additional caveats:
 

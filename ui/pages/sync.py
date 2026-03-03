@@ -8,21 +8,50 @@ from ui.theme import (card_frame, lbl, section_label, toggle_switch,
 from backend.syncthing import Syncthing
 
 
+_LAST_SYNC_STABILIZE_ATTEMPT = 0.0
+
+
 class SyncRefreshWorker(QThread):
     done = pyqtSignal(object)
 
     def run(self):
+        global _LAST_SYNC_STABILIZE_ATTEMPT
+        import time
         st = Syncthing()
         status = st.get_runtime_status(timeout=3)
         service_active = bool(status.get("service_active", False))
         api_reachable = bool(status.get("api_reachable", False))
-        if not service_active or not api_reachable:
+        reason = str(status.get("reason") or "unknown")
+        unit_file_state = str(status.get("unit_file_state") or "unknown")
+
+        if (not service_active) and unit_file_state != "masked" and reason in {
+            "unit_inactive_api_reachable",
+            "unit_inactive",
+            "unit_failed",
+            "service_inactive",
+        }:
+            now = time.time()
+            if (now - _LAST_SYNC_STABILIZE_ATTEMPT) > 30.0:
+                _LAST_SYNC_STABILIZE_ATTEMPT = now
+                st.set_running(True)
+                status = st.get_runtime_status(timeout=3)
+                service_active = bool(status.get("service_active", False))
+                api_reachable = bool(status.get("api_reachable", False))
+                reason = str(status.get("reason") or "unknown")
+                unit_file_state = str(status.get("unit_file_state") or "unknown")
+
+        effective_connected = bool(
+            (service_active and api_reachable)
+            or ((not service_active) and api_reachable)
+        )
+        if not effective_connected:
             self.done.emit(
                 {
                     "running": False,
                     "service_active": service_active,
                     "api_reachable": api_reachable,
-                    "reason": str(status.get("reason") or "unknown"),
+                    "unit_file_state": unit_file_state,
+                    "reason": reason,
                     "folders": [],
                     "rates": {},
                 }
@@ -32,7 +61,8 @@ class SyncRefreshWorker(QThread):
             "running": True,
             "service_active": service_active,
             "api_reachable": api_reachable,
-            "reason": str(status.get("reason") or "running"),
+            "unit_file_state": unit_file_state,
+            "reason": reason,
             "folders": st.get_folders(),
             "rates": st.get_transfer_rates(),
         })
@@ -97,6 +127,7 @@ class SyncPage(QWidget):
             self._clear_folders()
             service_active = bool((data or {}).get("service_active", False))
             api_reachable = bool((data or {}).get("api_reachable", False))
+            unit_file_state = str((data or {}).get("unit_file_state") or "unknown")
             reason = str((data or {}).get("reason") or "unknown")
             msg = (
                 "Syncthing service inactive · check systemd user unit"
@@ -105,6 +136,8 @@ class SyncPage(QWidget):
                 if not api_reachable
                 else "Syncthing unavailable"
             )
+            if (not service_active) and api_reachable and unit_file_state == "masked":
+                msg = "Syncthing API reachable (external instance); systemd unit is masked"
             self._folders_layout.addWidget(lbl(msg, 12, TEXT_DIM))
             self._speed_lbl.setText("↑ — · ↓ —")
             return
