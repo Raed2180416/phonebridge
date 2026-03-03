@@ -89,7 +89,12 @@ def ensure_hyprland_toggle_binding(project_root: Path) -> tuple[bool, str]:
         return False, "Hyprland config not found; skipped SUPER+P binding"
     bind_conf = config_dir / "phonebridge.conf"
     main_conf = config_dir / "hyprland.conf"
-    toggle_cmd = f"{project_root / 'run-venv-nix.sh'} --toggle"
+    toggle_script = project_root / "scripts" / "phonebridge-toggle.sh"
+    if toggle_script.exists():
+        toggle_cmd = f"{toggle_script}"
+    else:
+        # Fallback for older checkouts that don't yet have the fast relay script.
+        toggle_cmd = f"{project_root / 'run-venv-nix.sh'} --toggle"
     bind_lines = [
         f"bind = SUPER, P, exec, {toggle_cmd}\n",
     ]

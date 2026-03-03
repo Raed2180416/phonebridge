@@ -318,61 +318,94 @@ def main():
     app.aboutToQuit.connect(_cleanup_ipc)
 
     # ── System tray ──────────────────────────────────────────
-    tray = QSystemTrayIcon(app)
-    tray_icon = QIcon.fromTheme("phonebridge")
-    if tray_icon.isNull() and os.path.exists(icon_path):
-        tray_icon = QIcon(icon_path)
-    if tray_icon.isNull():
-        tray_icon = QIcon.fromTheme("smartphone")
-    if tray_icon.isNull():
-        tray_icon = QIcon.fromTheme("phone")
-    if tray_icon.isNull():
-        tray_icon = app.style().standardIcon(app.style().StandardPixmap.SP_DesktopIcon)
-    tray.setIcon(tray_icon)
-    tray.setToolTip("PhoneBridge")
-    menu = QMenu()
-    menu.addAction("Open PhoneBridge",   window.show_and_raise)
-    check_action = menu.addAction("Check Connectivity  →")
-    def _open_connectivity_from_tray():
-        from PyQt6.QtGui import QCursor
-        window.run_startup_check(
-            from_tray=True,
-            anchor_pos=QCursor.pos(),
-            close_on_mouse_leave=True,
+    tray = None
+    tray_retry_timer = QTimer(app)
+    tray_retry_timer.setInterval(3000)
+    tray_retry_timer.setSingleShot(False)
+
+    def _resolve_tray_icon() -> QIcon:
+        tray_icon = QIcon.fromTheme("phonebridge")
+        if tray_icon.isNull() and os.path.exists(icon_path):
+            tray_icon = QIcon(icon_path)
+        if tray_icon.isNull():
+            tray_icon = QIcon.fromTheme("smartphone")
+        if tray_icon.isNull():
+            tray_icon = QIcon.fromTheme("phone")
+        if tray_icon.isNull():
+            tray_icon = app.style().standardIcon(app.style().StandardPixmap.SP_DesktopIcon)
+        return tray_icon
+
+    def _install_tray() -> bool:
+        nonlocal tray
+        if tray is not None:
+            return True
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return False
+
+        tray = QSystemTrayIcon(app)
+        tray.setIcon(_resolve_tray_icon())
+        tray.setToolTip("PhoneBridge")
+        menu = QMenu()
+        menu.addAction("Open PhoneBridge",   window.show_and_raise)
+        check_action = menu.addAction("Check Connectivity  →")
+
+        def _open_connectivity_from_tray():
+            from PyQt6.QtGui import QCursor
+            window.run_startup_check(
+                from_tray=True,
+                anchor_pos=QCursor.pos(),
+                close_on_mouse_leave=True,
+            )
+
+        check_action.triggered.connect(_open_connectivity_from_tray)
+        check_action.setToolTip("Run startup diagnostics popout now")
+        check_action.setStatusTip("Run startup diagnostics popout now")
+        menu.addSeparator()
+
+        audio_action = menu.addAction("Route Phone Audio")
+        audio_action.setCheckable(True)
+        from backend.state import state
+        from backend import audio_route
+
+        def _toggle_audio(checked):
+            if checked:
+                audio_route.set_source("ui_global_toggle", True)
+                audio_route.sync()
+            else:
+                audio_route.clear_all()
+
+        audio_action.triggered.connect(_toggle_audio)
+
+        def _sync_audio_tray(enabled):
+            audio_action.blockSignals(True)
+            audio_action.setChecked(bool(enabled))
+            audio_action.blockSignals(False)
+
+        state.subscribe("audio_redirect_enabled", _sync_audio_tray)
+        _sync_audio_tray(state.get("audio_redirect_enabled"))
+
+        menu.addSeparator()
+        menu.addAction("Quit", window.quit_app)
+        tray.setContextMenu(menu)
+        tray.activated.connect(
+            lambda r: window.show_and_raise()
+            if r == QSystemTrayIcon.ActivationReason.Trigger else None
         )
-    check_action.triggered.connect(_open_connectivity_from_tray)
-    check_action.setToolTip("Run startup diagnostics popout now")
-    check_action.setStatusTip("Run startup diagnostics popout now")
-    menu.addSeparator()
+        tray.show()
+        return True
 
-    audio_action = menu.addAction("Route Phone Audio")
-    audio_action.setCheckable(True)
-    from backend.state import state
-    from backend import audio_route
-    def _toggle_audio(checked):
-        if checked:
-            audio_route.set_source("ui_global_toggle", True)
-            audio_route.sync()
-        else:
-            audio_route.clear_all()
-    audio_action.triggered.connect(_toggle_audio)
+    def _retry_tray_install():
+        if _install_tray():
+            tray_retry_timer.stop()
+            log.info("System tray icon ready")
 
-    def _sync_audio_tray(enabled):
-        audio_action.blockSignals(True)
-        audio_action.setChecked(bool(enabled))
-        audio_action.blockSignals(False)
-    state.subscribe("audio_redirect_enabled", _sync_audio_tray)
-    _sync_audio_tray(state.get("audio_redirect_enabled"))
-
-    menu.addSeparator()
-    menu.addAction("Quit", window.quit_app)
-    tray.setContextMenu(menu)
-    tray.activated.connect(
-        lambda r: window.show_and_raise()
-        if r == QSystemTrayIcon.ActivationReason.Trigger else None
-    )
-    tray.show()
-    log.info("PhoneBridge started (pid=%s, socket=%s, log=%s)", os.getpid(), sock_path, log_path)
+    if _install_tray():
+        log.info("PhoneBridge started (pid=%s, socket=%s, log=%s)", os.getpid(), sock_path, log_path)
+    else:
+        log.warning("System tray unavailable at startup; will retry until available")
+        tray_retry_timer.timeout.connect(_retry_tray_install)
+        tray_retry_timer.start()
+        log.info("PhoneBridge started without tray yet (pid=%s, socket=%s, log=%s)", os.getpid(), sock_path, log_path)
 
     # ── Startup ──────────────────────────────────────────────
     import backend.settings_store as settings
