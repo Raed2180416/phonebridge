@@ -20,6 +20,9 @@ from backend import audio_route
 import backend.connectivity_controller as connectivity
 
 
+_LAST_SYNCTHING_STABILIZE_ATTEMPT = 0.0
+
+
 class DndWorker(QThread):
     done = pyqtSignal(object)
 
@@ -45,6 +48,7 @@ class DashboardRefreshWorker(QThread):
         self._preferred_media_package = str(preferred_media_package or "")
 
     def run(self):
+        global _LAST_SYNCTHING_STABILIZE_ATTEMPT
         from backend.kdeconnect import KDEConnect
         from backend.adb_bridge import ADBBridge
         from backend.tailscale import Tailscale
@@ -66,6 +70,7 @@ class DashboardRefreshWorker(QThread):
             "syncthing_service_active": False,
             "syncthing_api_reachable": False,
             "syncthing_reason": "unknown",
+            "syncthing_unit_file_state": "unknown",
             "wifi_enabled": None,
             "bt_enabled": None,
         }
@@ -125,15 +130,28 @@ class DashboardRefreshWorker(QThread):
             result["kde_reachable"] = False
             result["kde_status"] = "unknown"
         try:
-            st_status = Syncthing().get_runtime_status(timeout=3)
+            st = Syncthing()
+            st_status = st.get_runtime_status(timeout=3)
+            reason = str(st_status.get("reason") or "")
+            unit_file_state = str(st_status.get("unit_file_state") or "unknown")
+            # Auto-stabilize mixed/inactive service states (throttled) so
+            # dashboard doesn't stay degraded when Syncthing can be recovered.
+            if reason in {"unit_inactive_api_reachable", "unit_inactive", "unit_failed", "service_inactive"} and unit_file_state != "masked":
+                now = time.time()
+                if (now - _LAST_SYNCTHING_STABILIZE_ATTEMPT) > 30.0:
+                    _LAST_SYNCTHING_STABILIZE_ATTEMPT = now
+                    st.set_running(True)
+                    st_status = st.get_runtime_status(timeout=3)
             result["syncthing_service_active"] = bool(st_status.get("service_active", False))
             result["syncthing_api_reachable"] = bool(st_status.get("api_reachable", False))
             result["syncthing_reason"] = str(st_status.get("reason") or "unknown")
+            result["syncthing_unit_file_state"] = str(st_status.get("unit_file_state") or "unknown")
             result["syncthing"] = bool(st_status.get("service_active", False))
         except Exception:
             result["syncthing_service_active"] = False
             result["syncthing_api_reachable"] = False
             result["syncthing_reason"] = "status_unavailable"
+            result["syncthing_unit_file_state"] = "unknown"
             result["syncthing"] = False
         try:
             result["wifi_enabled"] = adb.get_wifi_enabled()
@@ -538,7 +556,7 @@ class DashboardPage(QWidget):
         active = [s for s in valid if str(s.get("state") or "").strip().lower() in {"playing", "active"}]
         return (active[0] if active else valid[0]), valid
 
-    def _rounded_pixmap(self, pixmap: QPixmap, edge: int = 56, radius: int = 14) -> QPixmap:
+    def _rounded_pixmap(self, pixmap: QPixmap, edge: int = 56, radius: int = 18) -> QPixmap:
         if pixmap.isNull():
             return QPixmap()
         scaled = pixmap.scaled(edge, edge, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
@@ -555,7 +573,7 @@ class DashboardPage(QWidget):
     def _set_now_playing_artwork(self, media: dict | None):
         art_path = ""
         if isinstance(media, dict):
-            for key in ("artwork", "art", "album_art", "art_path", "cover_path"):
+            for key in ("artwork", "art", "album_art", "art_path", "cover_path", "display_icon_uri", "media_uri"):
                 val = str(media.get(key) or "").strip()
                 if val and os.path.exists(val):
                     art_path = val
@@ -579,7 +597,7 @@ class DashboardPage(QWidget):
             QLabel {{
                 background: rgba(255,255,255,0.05);
                 border: 1px solid rgba(255,255,255,0.14);
-                border-radius: 14px;
+                border-radius: 18px;
                 color: {TEXT_DIM};
                 font-size: 20px;
                 font-weight: 700;
@@ -774,6 +792,11 @@ class DashboardPage(QWidget):
         syncthing_service_active = bool((data or {}).get("syncthing_service_active", False))
         syncthing_api_reachable = bool((data or {}).get("syncthing_api_reachable", False))
         syncthing_reason = str((data or {}).get("syncthing_reason") or "unknown")
+        syncthing_unit_file_state = str((data or {}).get("syncthing_unit_file_state") or "unknown")
+        syncthing_effective_connected = bool(
+            (syncthing_service_active and syncthing_api_reachable)
+            or ((not syncthing_service_active) and syncthing_api_reachable)
+        )
 
         self._set_status_pill(
             self._ts_pill,
@@ -791,7 +814,7 @@ class DashboardPage(QWidget):
         self._set_status_pill(
             self._sync_pill,
             "Syncthing",
-            "connected" if (syncthing_service_active and syncthing_api_reachable)
+            "connected" if syncthing_effective_connected
             else "degraded" if (syncthing_service_active or syncthing_api_reachable)
             else "disconnected",
         )
@@ -811,6 +834,8 @@ class DashboardPage(QWidget):
 
         if syncthing_service_active and (not syncthing_api_reachable):
             self._net_card[2].setText(f"Syncthing API degraded ({syncthing_reason})")
+        elif (not syncthing_service_active) and syncthing_api_reachable and syncthing_unit_file_state == "masked":
+            self._net_card[2].setText("Syncthing API up (external instance)")
 
         bat = (data or {}).get("battery") or {}
         if bat and bat.get("charge", -1) >= 0:

@@ -643,6 +643,15 @@ class ADBBridge:
             sessions.append(current)
         if not sessions:
             return None
+
+        # Resolve artwork for all sessions so UI player-switch selections can
+        # render thumbnails as well (not only the initially chosen session).
+        for session in sessions:
+            try:
+                session["artwork"] = self._resolve_media_artwork(session.get("artwork", ""))
+            except Exception:
+                session["artwork"] = ""
+
         preferred = (preferred_package or "").strip()
         chosen = None
         if preferred:
