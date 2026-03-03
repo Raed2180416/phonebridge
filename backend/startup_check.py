@@ -270,7 +270,8 @@ class StartupCheckPopup(QWidget):
             "color:#f0b429;font-size:10px;border:none;background:transparent;padding:2px 0;"
         )
         self._deps_lbl.setVisible(False)
-        chips_wrap.addWidget(self._deps_lbl)        layout.addLayout(chips_wrap)
+        chips_wrap.addWidget(self._deps_lbl)
+        layout.addLayout(chips_wrap)
 
         actions = QHBoxLayout()
         actions.setContentsMargins(13, 0, 13, 13)
