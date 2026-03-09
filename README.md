@@ -52,9 +52,6 @@ PhoneBridge is meant to make the existing phone-on-desktop stack behave like one
   <img src="pics/notifpanel.png" alt="Notification panel" width="900" />
 </p>
 <p align="center">
-  <img src="pics/filesync.png" alt="File sync status" width="900" />
-</p>
-<p align="center">
   <img src="pics/filebrowser.png" alt="File browser" width="900" />
 </p>
 <p align="center">
