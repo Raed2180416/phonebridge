@@ -43,13 +43,7 @@ PhoneBridge is meant to make the existing phone-on-desktop stack behave like one
   <img src="pics/network.png" alt="Connectivity controls" width="900" />
 </p>
 <p align="center">
-  <img src="pics/calls.png" alt="Calls interface" width="900" />
-</p>
-<p align="center">
   <img src="pics/callpopup.png" alt="Incoming call popup" width="520" />
-</p>
-<p align="center">
-  <img src="pics/notifpanel.png" alt="Notification panel" width="900" />
 </p>
 <p align="center">
   <img src="pics/filebrowser.png" alt="File browser" width="900" />
