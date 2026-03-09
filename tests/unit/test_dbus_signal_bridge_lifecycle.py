@@ -8,7 +8,7 @@ import types
 
 import pytest
 
-pytest.importorskip("PyQt6.QtCore", exc_type=ImportError)
+pytest.importorskip("PyQt6.QtCore")
 
 
 def _install_stub(name: str, module: types.ModuleType, saved: dict[str, object | None]) -> None:

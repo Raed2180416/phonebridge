@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("PyQt6.QtCore", exc_type=ImportError)
+pytest.importorskip("PyQt6.QtCore")
 
 
 class _PageContainer:
