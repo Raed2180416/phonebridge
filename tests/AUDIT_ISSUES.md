@@ -1,12 +1,12 @@
 # PhoneBridge Deterministic Remediation Register
 
 Date: 2026-03-10
-Snapshot baseline: branch `snapshot/2026-03-10-pre-deterministic-remediation`  
+Snapshot baseline: branch `snapshot/2026-03-10-pre-deterministic-remediation`
 Snapshot commit/tag: `70d2d80` / `snapshot-2026-03-10-pre-deterministic-remediation`
 
 ## Current Deterministic Baseline
 - Command: `./scripts/run_pytest_nix.sh -q -m 'not hardware'`
-- Current result on the remediation worktree: `259 passed`
+- Current result on the remediation worktree: `263 passed`
 - Repeated stability rerun:
 
 ```bash
