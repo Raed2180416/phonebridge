@@ -1,46 +1,40 @@
-"""Files page — folder browser + send files to phone"""
+"""Files page — folder browser + send files to phone."""
+import logging
 import os
 import subprocess
-import logging
-import hashlib
-import tempfile
-import shutil
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
-                              QLabel, QPushButton, QFrame, QFileDialog,
-                              QGridLayout, QInputDialog, QMessageBox)
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap
+from PyQt6.QtWidgets import (
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+import backend.settings_store as settings
 from ui.theme import (card_frame, lbl, section_label, action_btn, input_field,
                       divider, with_alpha, TEAL, CYAN, VIOLET, ROSE, AMBER, BLUE,
                       TEXT, TEXT_DIM, TEXT_MID, BORDER)
 from backend.kdeconnect import KDEConnect
 from backend.syncthing import Syncthing
-import backend.settings_store as settings
+from ui.pages.files_backend import (
+    DEFAULT_FOLDERS,
+    FilesLoadWorker,
+    FilesMutationWorker,
+    list_entries_payload,
+)
+from ui.pages.files_actions import FilesActionsMixin
 
 log = logging.getLogger(__name__)
 
-SYNC_ROOT = os.path.expanduser("~/PhoneSync")
+class FilesPage(FilesActionsMixin, QWidget):
+    allow_periodic_refresh = False
+    allow_runtime_status_refresh = False
 
-DEFAULT_FOLDERS = [
-    {"icon":"📲","name":"KDE Connect Inbox", "id":"kdeconnect-inbox",
-     "path":"~/Downloads",                 "synced":False, "color":"#6ea8ff"},
-    {"icon":"📸","name":"Camera Roll",    "id":"phone-camera",
-     "path":f"{SYNC_ROOT}/Camera",       "synced":True,  "color":TEAL},
-    {"icon":"📄","name":"Documents",      "id":"phone-docs",
-     "path":f"{SYNC_ROOT}/Documents",    "synced":True,  "color":CYAN},
-    {"icon":"📥","name":"Downloads",      "id":"phone-downloads",
-     "path":f"{SYNC_ROOT}/Downloads",    "synced":False, "color":AMBER},
-    {"icon":"💬","name":"WhatsApp Media", "id":"phone-whatsapp",
-     "path":f"{SYNC_ROOT}/WhatsApp",     "synced":True,  "color":"#25d366"},
-    {"icon":"🖼️","name":"Screenshots",   "id":"phone-screenshots",
-     "path":f"{SYNC_ROOT}/Screenshots",  "synced":True,  "color":VIOLET},
-    {"icon":"📤","name":"PhoneSend",      "id":"phone-send",
-     "path":f"{SYNC_ROOT}/PhoneSend",    "synced":True,  "color":ROSE},
-    {"icon":"🎬","name":"PhoneBridge Recordings", "id":"phonebridge-recordings",
-     "path":f"{SYNC_ROOT}/PhoneBridgeRecordings", "synced":False, "color":BLUE},
-]
-
-class FilesPage(QWidget):
     def __init__(self):
         super().__init__()
         self.setStyleSheet("background:transparent;")
@@ -48,44 +42,89 @@ class FilesPage(QWidget):
         self.st = Syncthing()
         self._current_folder = None
         self._entry_limits = {}
-        self._folders = self._load_folders()
+        self._folders = []
+        self._load_worker: FilesLoadWorker | None = None
+        self._load_workers: set[FilesLoadWorker] = set()
+        self._load_token = 0
+        self._mutation_worker: FilesMutationWorker | None = None
         self._main_layout = QVBoxLayout(self)
         self._main_layout.setContentsMargins(24,24,24,24)
         self._main_layout.setSpacing(14)
-        self._build_folder_grid()
+        self.destroyed.connect(lambda *_args: self._cancel_load())
+        self._show_loading("Loading files…")
+        self.refresh()
 
-    def _load_folders(self):
-        overrides = settings.get("folder_overrides", {}) or {}
-        custom = settings.get("custom_folders", []) or []
-        folders = []
-        kde_receive_path = self.kc.get_receive_path()
-        for folder in DEFAULT_FOLDERS:
-            merged = dict(folder)
-            fid = merged.get("id")
-            if fid == "kdeconnect-inbox":
-                merged["path"] = kde_receive_path
-            if fid in overrides and overrides[fid]:
-                merged["path"] = overrides[fid]
-            folders.append(merged)
-        for row in custom:
-            if not isinstance(row, dict):
-                continue
-            name = (row.get("name") or "").strip()
-            path = (row.get("path") or "").strip()
-            if not name or not path:
-                continue
-            fid = (row.get("id") or f"custom-{hashlib.sha1(path.encode('utf-8')).hexdigest()[:10]}").strip()
-            folders.append({
-                "icon": row.get("icon") or "📁",
-                "name": name,
-                "id": fid,
-                "path": path,
-                "synced": bool(row.get("synced", False)),
-                "color": row.get("color") or BLUE,
-                "syncthing_id": row.get("syncthing_id", ""),
-                "custom": True,
-            })
-        return folders
+    def _cancel_load(self):
+        for worker in list(self._load_workers):
+            try:
+                worker.cancel()
+            except Exception:
+                pass
+        self._load_worker = None
+
+    def _finish_load_worker(self, worker: FilesLoadWorker):
+        self._load_workers.discard(worker)
+        if self._load_worker is worker:
+            self._load_worker = None
+
+    def _start_load(self, *, mode: str, folder: dict | None = None):
+        self._cancel_load()
+        self._load_token += 1
+        folder_id = str((folder or {}).get("id") or "")
+        log.info("Files page load start mode=%s token=%s folder_id=%s", mode, self._load_token, folder_id)
+        worker = FilesLoadWorker(
+            token=self._load_token,
+            mode=mode,
+            folder=folder,
+            limit=self._entry_limits.get(str((folder or {}).get("id") or ""), 72),
+        )
+        worker.done.connect(self._apply_loaded_payload)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda _ok=True, w=worker: self._finish_load_worker(w))
+        self._load_workers.add(worker)
+        self._load_worker = worker
+        worker.start()
+
+    def _show_loading(self, message: str):
+        self._clear_main_layout()
+        self._main_layout.addWidget(lbl("File Browser", 22, bold=True))
+        self._main_layout.addWidget(lbl(str(message or "Loading…"), 12, TEXT_DIM))
+        self._main_layout.addStretch()
+
+    def _apply_loaded_payload(self, payload):
+        if not isinstance(payload, dict):
+            return
+        if int(payload.get("token") or 0) != self._load_token:
+            return
+        if bool(payload.get("cancelled")):
+            return
+        if payload.get("mode") == "grid":
+            self._folders = list(payload.get("folders") or [])
+            self._current_folder = None
+            log.info("Files page loaded grid token=%s folders=%s", payload.get("token"), len(self._folders))
+            self._build_folder_grid()
+            return
+        folder = dict(payload.get("folder") or self._current_folder or {})
+        self._current_folder = folder
+        entries = list(payload.get("entries") or [])
+        thumb_count = sum(1 for row in entries if str((row or {}).get("thumb_path") or "").strip())
+        log.info(
+            "Files page loaded folder token=%s folder_id=%s entries=%s thumbs=%s truncated=%s",
+            payload.get("token"),
+            folder.get("id"),
+            len(entries),
+            thumb_count,
+            bool(payload.get("truncated", False)),
+        )
+        self._clear_main_layout()
+        self._main_layout.addWidget(
+            self._file_view(
+                folder,
+                entries=entries,
+                truncated=bool(payload.get("truncated", False)),
+            )
+        )
+        self._main_layout.addStretch()
 
     def _save_folders(self):
         overrides = {}
@@ -109,8 +148,39 @@ class FilesPage(QWidget):
                     "color": folder.get("color", BLUE),
                     "syncthing_id": folder.get("syncthing_id", ""),
                 })
-        settings.set("folder_overrides", overrides)
-        settings.set("custom_folders", custom)
+        settings.set_many({
+            "folder_overrides": overrides,
+            "custom_folders": custom,
+        })
+
+    def _folder_by_id(self, folder_id: str):
+        fid = str(folder_id or "")
+        for row in self._folders:
+            if str(row.get("id") or "") == fid:
+                return row
+        return None
+
+    def _update_folder_state(self, folder_id: str, **updates):
+        row = self._folder_by_id(folder_id)
+        if row is not None:
+            row.update(updates)
+        if self._current_folder and str(self._current_folder.get("id") or "") == str(folder_id or ""):
+            self._current_folder.update(updates)
+
+    def _finish_mutation(self):
+        self._mutation_worker = None
+
+    def _start_mutation(self, *, mode: str, folder: dict, callback) -> bool:
+        if self._mutation_worker is not None and self._mutation_worker.isRunning():
+            QMessageBox.information(self, "PhoneBridge", "Please wait for the current folder action to finish.")
+            return False
+        worker = FilesMutationWorker(mode=mode, folder=folder)
+        worker.done.connect(callback)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(self._finish_mutation)
+        self._mutation_worker = worker
+        worker.start()
+        return True
 
     def _build_folder_grid(self):
         self._clear_main_layout()
@@ -196,7 +266,7 @@ class FilesPage(QWidget):
         status_row = QHBoxLayout()
         pip = QFrame()
         pip.setFixedSize(7,7)
-        synced = self._is_synced_in_syncthing(folder)
+        synced = bool(folder.get("synced", False))
         folder["synced"] = synced
         pip_color = TEAL if synced else AMBER
         pip.setStyleSheet(f"""
@@ -221,13 +291,11 @@ class FilesPage(QWidget):
         fid = folder.get("id")
         if fid and fid not in self._entry_limits:
             self._entry_limits[fid] = 72
-        # Clear and rebuild for file view
-        self._clear_main_layout()
+        log.info("Files page opening folder folder_id=%s path=%s", fid, folder.get("path", ""))
+        self._show_loading(f"Loading {folder.get('name', 'folder')}…")
+        self._start_load(mode="folder", folder=folder)
 
-        self._main_layout.addWidget(self._file_view(folder))
-        self._main_layout.addStretch()
-
-    def _file_view(self, folder):
+    def _file_view(self, folder, *, entries=None, truncated=False):
         frame = card_frame()
         fl = QVBoxLayout(frame)
         fl.setContentsMargins(20,16,20,16)
@@ -291,10 +359,7 @@ class FilesPage(QWidget):
         fl.addWidget(divider())
 
         # File list
-        path = folder["path"]
-        fid = folder.get("id", "")
-        limit = self._entry_limits.get(fid, 72)
-        entries, truncated = self._list_entries(path, limit=limit)
+        entries = list(entries or [])
 
         if not entries:
             fl.addWidget(lbl("No files found — folder may be empty or not synced yet",
@@ -304,6 +369,8 @@ class FilesPage(QWidget):
                 fl.addWidget(self._file_row(
                     row["name"],
                     row["full"],
+                    size=row.get("size"),
+                    thumb_path=row.get("thumb_path"),
                     allow_thumbnail=(idx < 36),
                 ))
             if truncated:
@@ -313,7 +380,7 @@ class FilesPage(QWidget):
 
         return frame
 
-    def _file_row(self, name, full_path, allow_thumbnail=True):
+    def _file_row(self, name, full_path, *, size=None, thumb_path=None, allow_thumbnail=True):
         ext  = name.rsplit(".",1)[-1].lower() if "." in name else ""
         ico  = {"jpg":"🖼️","jpeg":"🖼️","png":"🖼️","gif":"🖼️",
                 "mp4":"🎥","mov":"🎥","mp3":"🎵","opus":"🎵",
@@ -321,9 +388,9 @@ class FilesPage(QWidget):
                 "apk":"📦","zip":"📦"}.get(ext,"📁")
 
         try:
-            size = os.path.getsize(full_path)
-            size_str = f"{size/1024/1024:.1f} MB" if size > 1024*1024 else f"{size/1024:.0f} KB"
-        except:
+            actual_size = int(size if size is not None else os.path.getsize(full_path))
+            size_str = f"{actual_size/1024/1024:.1f} MB" if actual_size > 1024*1024 else f"{actual_size/1024:.0f} KB"
+        except Exception:
             size_str = "—"
 
         row = QFrame()
@@ -342,7 +409,13 @@ class FilesPage(QWidget):
         rl.setContentsMargins(12,9,12,9)
         rl.setSpacing(12)
 
-        thumb = self._thumbnail_label(full_path, ext, ico, allow_thumbnail=allow_thumbnail)
+        thumb = self._thumbnail_label(
+            full_path,
+            ext,
+            ico,
+            allow_thumbnail=allow_thumbnail,
+            thumb_path=thumb_path,
+        )
         rl.addWidget(thumb)
 
         info = QVBoxLayout()
@@ -381,7 +454,8 @@ class FilesPage(QWidget):
 
     def _back_to_grid(self):
         self._current_folder = None
-        self._build_folder_grid()
+        self._show_loading("Loading files…")
+        self._start_load(mode="grid")
 
     def _load_more_entries(self, folder):
         fid = folder.get("id")
@@ -418,27 +492,7 @@ class FilesPage(QWidget):
             log.warning("Failed to open path %s: %s", path, e)
 
     def _list_entries(self, path, limit=120):
-        rows = []
-        truncated = False
-        scan_cap = max(limit * 6, limit)
-        try:
-            with os.scandir(path) as it:
-                for entry in it:
-                    rows.append({
-                        "name": entry.name,
-                        "full": entry.path,
-                        "is_dir": entry.is_dir(follow_symlinks=False),
-                    })
-                    if len(rows) >= scan_cap:
-                        truncated = True
-                        break
-        except Exception:
-            return [], False
-        rows.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
-        if len(rows) > limit:
-            rows = rows[:limit]
-            truncated = True
-        return rows, truncated
+        return list_entries_payload(path, limit=limit)
 
     def _set_folder_path(self, folder, new_path):
         if not new_path:
@@ -447,6 +501,8 @@ class FilesPage(QWidget):
         self._save_folders()
         if self._current_folder and self._current_folder.get("id") == folder.get("id"):
             self._open_folder(folder)
+        else:
+            self.refresh()
 
     def _create_subfolder(self, folder):
         base = folder.get("path", "")
@@ -462,148 +518,15 @@ class FilesPage(QWidget):
         except Exception as e:
             log.warning("Create folder failed %s: %s", target, e)
 
-    def _add_custom_folder(self):
-        path = self._pick_existing_dir("Choose folder", os.path.expanduser("~"))
-        if not path:
-            return
-        default_name = os.path.basename(path.rstrip("/")) or "Custom Folder"
-        name = self._pick_text("Folder Name", "Display name:", default_name)
-        if not name:
-            return
-        fid = f"custom-{hashlib.sha1(path.encode('utf-8')).hexdigest()[:10]}"
-        self._folders.append({
-            "icon": "📁",
-            "name": name,
-            "id": fid,
-            "path": path,
-            "synced": False,
-            "color": BLUE,
-            "syncthing_id": "",
-            "custom": True,
-        })
-        self._save_folders()
-        self._build_folder_grid()
-
-    def _folder_syncthing_id(self, folder):
-        return (folder.get("syncthing_id") or folder.get("id") or "").strip()
-
-    def _is_synced_in_syncthing(self, folder):
-        fid = self._folder_syncthing_id(folder)
-        path = os.path.normpath(str(folder.get("path", "") or ""))
-        if fid and self.st.get_folder(fid) is not None:
-            return True
-        for row in self.st.get_folders() or []:
-            candidate = os.path.normpath(str(row.get("path", "") or ""))
-            if path and candidate and path == candidate:
-                return True
-        return False
-
-    def _refresh_sync_btn(self, folder, button):
-        synced = self._is_synced_in_syncthing(folder)
-        folder["synced"] = synced
-        if synced:
-            button.setText("Synced")
-            button.setEnabled(False)
-        else:
-            button.setText("Sync Folder")
-            button.setEnabled(True)
-        self._save_folders()
-
-    def _toggle_syncthing_sync(self, folder, button):
-        if not self.st.is_running():
-            QMessageBox.warning(self, "Syncthing", "Syncthing is not running on this system.")
-            return
-        fid = self._folder_syncthing_id(folder)
-        if not fid:
-            return
-        if self._is_synced_in_syncthing(folder):
-            self._refresh_sync_btn(folder, button)
-            return
-        ok, created = self.st.add_folder(
-            path=folder.get("path", ""),
-            label=folder.get("name", ""),
-            folder_id=fid,
-            folder_type="sendreceive",
-        )
-        if ok:
-            folder["syncthing_id"] = fid if created in {"updated", fid} else str(created)
-            folder["synced"] = True
-            self._refresh_sync_btn(folder, button)
-        else:
-            QMessageBox.warning(self, "Syncthing", "Failed to add folder to Syncthing.")
-
-    def _pick_text(self, title, prompt, default_text):
-        text, ok = QInputDialog.getText(self, title, prompt, text=default_text)
-        text = (text or "").strip()
-        if ok and text:
-            return text
-        return ""
-
-    def _remove_custom_folder(self, folder, confirm=True):
-        if not folder.get("custom"):
-            return
-        if confirm:
-            answer = QMessageBox.question(
-                self,
-                "Remove Folder Card",
-                f"Remove '{folder.get('name', 'Folder')}' from PhoneBridge?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-        fid = self._folder_syncthing_id(folder)
-        if fid and self._is_synced_in_syncthing(folder):
-            self.st.remove_folder(fid)
-        self._folders = [f for f in self._folders if f is not folder]
-        self._save_folders()
-        self._build_folder_grid()
-
-    def _delete_physical_folder(self, folder):
-        path = folder.get("path", "")
-        if not path:
-            return
-        answer = QMessageBox.question(
-            self,
-            "Delete Folder",
-            f"Delete folder from disk?\n{path}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            if shutil.which("gio"):
-                subprocess.run(["gio", "trash", path], timeout=5)
-            elif os.path.isdir(path):
-                shutil.rmtree(path)
-            elif os.path.exists(path):
-                os.remove(path)
-            if folder.get("custom"):
-                self._remove_custom_folder(folder, confirm=False)
-            else:
-                self._open_folder(folder)
-        except Exception as e:
-            log.warning("Delete folder failed %s: %s", path, e)
-
-    def _pick_existing_dir(self, title, start_dir):
-        return QFileDialog.getExistingDirectory(self, title, start_dir)
-
-    def _pick_files(self, title, start_dir):
-        files, _ = QFileDialog.getOpenFileNames(self, title, start_dir, "All files (*)")
-        return files
-
     def refresh(self):
-        self._folders = self._load_folders()
         if self._current_folder:
-            fid = self._current_folder.get("id")
-            match = next((f for f in self._folders if f.get("id") == fid), self._current_folder)
-            self._current_folder = match
-            self._open_folder(match)
+            self._show_loading(f"Loading {self._current_folder.get('name', 'folder')}…")
+            self._start_load(mode="folder", folder=self._current_folder)
             return
-        self._build_folder_grid()
+        self._show_loading("Loading files…")
+        self._start_load(mode="grid")
 
-    def _thumbnail_label(self, full_path, ext, fallback_ico, allow_thumbnail=True):
+    def _thumbnail_label(self, full_path, ext, fallback_ico, *, allow_thumbnail=True, thumb_path=None):
         thumb = QLabel(fallback_ico)
         thumb.setFixedSize(36, 36)
         thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -612,106 +535,12 @@ class FilesPage(QWidget):
         if not allow_thumbnail:
             return thumb
 
-        image_ext = {"jpg", "jpeg", "png", "gif", "webp", "bmp"}
-        video_ext = {"mp4", "mov", "mkv", "webm", "avi", "3gp"}
-
-        if ext in image_ext and os.path.exists(full_path):
-            pix = QPixmap(full_path)
+        if thumb_path and os.path.exists(thumb_path):
+            pix = QPixmap(thumb_path)
             if not pix.isNull():
                 thumb.setPixmap(pix.scaled(36, 36, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                                            Qt.TransformationMode.SmoothTransformation))
                 thumb.setText("")
             return thumb
 
-        if ext in video_ext and os.path.exists(full_path):
-            ffthumb = self._video_thumb_path(full_path)
-            if ffthumb and self._is_valid_thumb_file(ffthumb):
-                pix = QPixmap(ffthumb)
-                if not pix.isNull():
-                    thumb.setPixmap(pix.scaled(36, 36, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                                               Qt.TransformationMode.SmoothTransformation))
-                    thumb.setText("")
-            return thumb
-
         return thumb
-
-    @staticmethod
-    def _is_valid_thumb_file(path):
-        if not path or not os.path.exists(path):
-            return False
-        try:
-            if os.path.getsize(path) <= 0:
-                return False
-        except Exception:
-            return False
-        pix = QPixmap(path)
-        return not pix.isNull()
-
-    def _video_thumb_path(self, video_path):
-        cache_dir = os.path.join(tempfile.gettempdir(), "phonebridge-thumbs")
-        os.makedirs(cache_dir, exist_ok=True)
-        try:
-            st = os.stat(video_path)
-            fingerprint = f"{video_path}|{int(st.st_mtime)}|{st.st_size}"
-        except Exception:
-            fingerprint = video_path
-        key = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()
-        out = os.path.join(cache_dir, f"{key}.jpg")
-        if self._is_valid_thumb_file(out):
-            return out
-        if os.path.exists(out):
-            try:
-                os.remove(out)
-            except Exception:
-                pass
-        if shutil.which("ffmpegthumbnailer"):
-            try:
-                proc = subprocess.run(
-                    ["ffmpegthumbnailer", "-i", video_path, "-o", out, "-s", "128", "-q", "8"],
-                    capture_output=True,
-                    text=True,
-                    timeout=6,
-                )
-                if self._is_valid_thumb_file(out):
-                    return out
-                if proc.returncode != 0:
-                    log.debug("ffmpegthumbnailer failed for %s: %s", video_path, (proc.stderr or proc.stdout or "").strip())
-            except Exception:
-                log.debug("ffmpegthumbnailer exception for %s", video_path, exc_info=True)
-        if shutil.which("ffmpeg"):
-            try:
-                proc = subprocess.run(
-                    [
-                        "ffmpeg", "-y", "-loglevel", "error",
-                        "-ss", "00:00:01", "-i", video_path,
-                        "-frames:v", "1", "-vf", "scale=128:-1", out,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=8,
-                )
-                if self._is_valid_thumb_file(out):
-                    return out
-                # Some very short clips have no frame at 1s; fallback to first frame.
-                proc2 = subprocess.run(
-                    [
-                        "ffmpeg", "-y", "-loglevel", "error",
-                        "-i", video_path,
-                        "-frames:v", "1", "-vf", "scale=128:-1", out,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=8,
-                )
-                if self._is_valid_thumb_file(out):
-                    return out
-                if proc.returncode != 0 or proc2.returncode != 0:
-                    log.debug(
-                        "ffmpeg thumbnail failed for %s: first=%s second=%s",
-                        video_path,
-                        (proc.stderr or proc.stdout or "").strip(),
-                        (proc2.stderr or proc2.stdout or "").strip(),
-                    )
-            except Exception:
-                log.debug("ffmpeg thumbnail exception for %s", video_path, exc_info=True)
-        return None

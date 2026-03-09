@@ -1,197 +1,35 @@
-"""Dashboard page"""
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
-                              QLabel, QPushButton, QGridLayout, QFrame, QApplication, QListWidget, QListWidgetItem, QStyle, QMenu)
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QPropertyAnimation, QEasingCurve, QPoint, QSize
-from PyQt6.QtGui import QPainter, QColor, QPixmap, QIcon, QPainterPath
+"""Dashboard page."""
+
 import time
-import os
+
+from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtWidgets import QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+
+from backend import audio_route
+from backend.adb_bridge import ADBBridge
+from backend.bluetooth_manager import BluetoothManager
+import backend.connectivity_controller as connectivity
+from backend.kdeconnect import KDEConnect
+import backend.settings_store as settings
+from backend.tailscale import Tailscale
+from backend.ui_feedback import push_toast
+from backend.state import state
+from ui.pages.connectivity_widgets import (
+    ToggleActionWorker,
+    build_conn_row,
+    set_conn_row_busy,
+    set_conn_row_state,
+    set_status_pill,
+)
+from ui.pages.dashboard_media import DashboardMediaMixin
+from ui.pages.dashboard_workers import DashboardRefreshWorker, DndWorker
 from ui.theme import (card_frame, lbl, pill, section_label, action_btn, input_field,
                       toggle_switch, divider, TEAL, CYAN, VIOLET, ROSE,
                       with_alpha,
                       AMBER, BLUE, TEXT, TEXT_DIM, TEXT_MID, FROST, BORDER)
-from backend.kdeconnect import KDEConnect
-from backend.tailscale import Tailscale
-from backend.adb_bridge import ADBBridge
-from backend.bluetooth_manager import BluetoothManager
-from backend.ui_feedback import push_toast
-import backend.settings_store as settings
-from backend.clipboard_history import sanitize_clipboard_history
-from backend import audio_route
-import backend.connectivity_controller as connectivity
 
 
-_LAST_SYNCTHING_STABILIZE_ATTEMPT = 0.0
-
-
-class DndWorker(QThread):
-    done = pyqtSignal(object)
-
-    def __init__(self, adb, target_state=None):
-        super().__init__()
-        self._adb = adb
-        self._target_state = target_state
-
-    def run(self):
-        if self._target_state is None:
-            self.done.emit(self._adb.get_dnd_enabled())
-            return
-        self._adb.toggle_dnd(bool(self._target_state))
-        self.done.emit(self._adb.get_dnd_enabled())
-
-
-class DashboardRefreshWorker(QThread):
-    done = pyqtSignal(object)
-
-    def __init__(self, include_media=False, preferred_media_package: str = ""):
-        super().__init__()
-        self._include_media = include_media
-        self._preferred_media_package = str(preferred_media_package or "")
-
-    def run(self):
-        global _LAST_SYNCTHING_STABILIZE_ATTEMPT
-        from backend.kdeconnect import KDEConnect
-        from backend.adb_bridge import ADBBridge
-        from backend.tailscale import Tailscale
-        from backend.syncthing import Syncthing
-        import backend.settings_store as settings
-        result = {
-            "battery": None,
-            "network_type": None,
-            "signal_strength": None,
-            "media": None,
-            "tailscale": False,
-            "tailscale_local": False,
-            "tailscale_ip": None,
-            "tailscale_mesh_reason": "",
-            "kde_enabled": True,
-            "kde_reachable": False,
-            "kde_status": "unknown",
-            "syncthing": False,
-            "syncthing_service_active": False,
-            "syncthing_api_reachable": False,
-            "syncthing_reason": "unknown",
-            "syncthing_unit_file_state": "unknown",
-            "wifi_enabled": None,
-            "bt_enabled": None,
-        }
-        kc = KDEConnect()
-        adb = ADBBridge()
-        try:
-            battery = kc.get_battery()
-            if not battery or int(battery.get("charge", -1)) < 0:
-                level = adb.get_battery_level()
-                if level >= 0:
-                    battery = {"charge": int(level), "is_charging": False, "source": "adb"}
-            result["battery"] = battery
-        except Exception:
-            result["battery"] = None
-        try:
-            result["network_type"] = kc.get_network_type()
-            result["signal_strength"] = kc.get_signal_strength()
-        except Exception:
-            result["network_type"] = None
-            result["signal_strength"] = None
-        try:
-            ts = Tailscale()
-            snapshot = ts.get_mesh_snapshot(
-                phone_name=settings.get("device_name", ""),
-                phone_ip=settings.get("phone_tailscale_ip", ""),
-            )
-            result["tailscale_local"] = bool(snapshot.get("local_connected", False))
-            result["tailscale"] = bool(snapshot.get("mesh_ready", False))
-            result["tailscale_mesh_reason"] = str(snapshot.get("mesh_reason") or "")
-            if settings.get("tailscale_force_off", False) and result["tailscale_local"]:
-                ts.down()
-                snapshot = ts.get_mesh_snapshot(
-                    phone_name=settings.get("device_name", ""),
-                    phone_ip=settings.get("phone_tailscale_ip", ""),
-                )
-                result["tailscale_local"] = bool(snapshot.get("local_connected", False))
-                result["tailscale"] = bool(snapshot.get("mesh_ready", False))
-                result["tailscale_mesh_reason"] = str(snapshot.get("mesh_reason") or "")
-            result["tailscale_ip"] = snapshot.get("self_ip")
-        except Exception:
-            result["tailscale"] = False
-            result["tailscale_local"] = False
-            result["tailscale_mesh_reason"] = "tailscale status unavailable"
-            result["tailscale_ip"] = None
-        try:
-            result["kde_enabled"] = bool(settings.get("kde_integration_enabled", True))
-            _raw = kc.is_reachable() if result["kde_enabled"] else None
-            result["kde_reachable"] = _raw is True
-            result["kde_status"] = (
-                "disabled" if not result["kde_enabled"]
-                else "reachable" if _raw is True
-                else "unreachable" if _raw is False
-                else "unknown"
-            )
-        except Exception:
-            result["kde_enabled"] = bool(settings.get("kde_integration_enabled", True))
-            result["kde_reachable"] = False
-            result["kde_status"] = "unknown"
-        try:
-            st = Syncthing()
-            st_status = st.get_runtime_status(timeout=3)
-            reason = str(st_status.get("reason") or "")
-            unit_file_state = str(st_status.get("unit_file_state") or "unknown")
-            # Auto-stabilize mixed/inactive service states (throttled) so
-            # dashboard doesn't stay degraded when Syncthing can be recovered.
-            if reason in {"unit_inactive_api_reachable", "unit_inactive", "unit_failed", "service_inactive"} and unit_file_state != "masked":
-                now = time.time()
-                if (now - _LAST_SYNCTHING_STABILIZE_ATTEMPT) > 30.0:
-                    _LAST_SYNCTHING_STABILIZE_ATTEMPT = now
-                    st.set_running(True)
-                    st_status = st.get_runtime_status(timeout=3)
-            result["syncthing_service_active"] = bool(st_status.get("service_active", False))
-            result["syncthing_api_reachable"] = bool(st_status.get("api_reachable", False))
-            result["syncthing_reason"] = str(st_status.get("reason") or "unknown")
-            result["syncthing_unit_file_state"] = str(st_status.get("unit_file_state") or "unknown")
-            result["syncthing"] = bool(st_status.get("service_active", False))
-        except Exception:
-            result["syncthing_service_active"] = False
-            result["syncthing_api_reachable"] = False
-            result["syncthing_reason"] = "status_unavailable"
-            result["syncthing_unit_file_state"] = "unknown"
-            result["syncthing"] = False
-        try:
-            result["wifi_enabled"] = adb.get_wifi_enabled()
-        except Exception:
-            result["wifi_enabled"] = None
-        try:
-            result["bt_enabled"] = adb.get_bluetooth_enabled()
-        except Exception:
-            result["bt_enabled"] = None
-        if self._include_media:
-            try:
-                result["media"] = adb.get_now_playing(preferred_package=self._preferred_media_package)
-            except Exception:
-                result["media"] = None
-        self.done.emit(result)
-
-
-class ToggleActionWorker(QThread):
-    done = pyqtSignal(bool, str, object)
-
-    def __init__(self, action):
-        super().__init__()
-        self._action = action
-
-    def run(self):
-        try:
-            out = self._action()
-            if isinstance(out, tuple) and len(out) >= 3:
-                ok, msg, actual = out[0], out[1], out[2]
-            elif isinstance(out, tuple) and len(out) == 2:
-                ok, msg = out
-                actual = None
-            else:
-                ok, msg, actual = bool(out), "", None
-        except Exception as e:
-            ok, msg, actual = False, str(e), None
-        self.done.emit(bool(ok), str(msg or ""), actual)
-
-
-class DashboardPage(QWidget):
+class DashboardPage(DashboardMediaMixin, QWidget):
     _EMPTY_MEDIA_TEXT = "Nothing playing right now. Play something to see it."
 
     def __init__(self):
@@ -216,8 +54,8 @@ class DashboardPage(QWidget):
         self._active_media_pkg_pref = ""
         self._build()
         from backend.state import state
-        state.subscribe("audio_redirect_enabled", self._on_audio_redirect_state_changed)
-        state.subscribe("connectivity_ops_busy", self._on_connectivity_ops_busy)
+        state.subscribe("audio_redirect_enabled", self._on_audio_redirect_state_changed, owner=self)
+        state.subscribe("connectivity_ops_busy", self._on_connectivity_ops_busy, owner=self)
         self._sync_audio_route_toggle()
         self.refresh()
 
@@ -386,7 +224,6 @@ class DashboardPage(QWidget):
         actions = [
             ("✆", "Ring Phone",      TEAL,   self._ring),
             ("⌧", "Lock Phone",      VIOLET, self._lock_phone),
-            ("☎", "Calls Panel",     CYAN,   self._go_calls),
             ("▤", "View Clipboard",  TEAL,   self._view_clipboard),
             ("⦿", "DND",             AMBER,  self._toggle_dnd),
         ]
@@ -436,7 +273,7 @@ class DashboardPage(QWidget):
         cl = QVBoxLayout(conn_frame)
         cl.setContentsMargins(0,8,0,8)
         cl.setSpacing(0)
-        self._audio_row = self._conn_row(
+        self._audio_row = build_conn_row(
             "🔊",
             "Phone Audio to PC",
             "Global audio route (shared with Mirror page)",
@@ -446,194 +283,22 @@ class DashboardPage(QWidget):
         )
         cl.addWidget(self._audio_row)
         cl.addWidget(divider())
-        self._wifi_row = self._conn_row("📡","Wi-Fi",
-                                    "Phone Wi-Fi radio", True, CYAN,
-                                    on_toggle=self._toggle_wifi_action)
+        self._wifi_row = build_conn_row("📡","Wi-Fi",
+                                        "Phone Wi-Fi radio", True, CYAN,
+                                        on_toggle=self._toggle_wifi_action)
         cl.addWidget(self._wifi_row)
         cl.addWidget(divider())
-        self._bt_row = self._conn_row("🦷","Bluetooth",
-                                    "Phone Bluetooth radio", True, VIOLET,
-                                    on_toggle=self._toggle_bluetooth_action)
+        self._bt_row = build_conn_row("🦷","Bluetooth",
+                                      "Phone Bluetooth radio", True, VIOLET,
+                                      on_toggle=self._toggle_bluetooth_action)
         cl.addWidget(self._bt_row)
         cl.addWidget(divider())
-        self._hs_row = self._conn_row("📡","Mobile Hotspot",
-                                    "Auto: USB tether (if wired) else Wi-Fi hotspot", False, CYAN,
-                                    on_toggle=self._hotspot)
+        self._hs_row = build_conn_row("📡","Mobile Hotspot",
+                                      "Auto: USB tether (if wired) else Wi-Fi hotspot", False, CYAN,
+                                      on_toggle=self._hotspot)
         cl.addWidget(self._hs_row)
         layout.addWidget(conn_frame)
         layout.addStretch()
-
-    def _media_icon_btn(self, icon_name, color):
-        b = QPushButton("")
-        b.setFixedSize(42, 42)
-        b.setStyleSheet(f"""
-            QPushButton {{
-                background: rgba(255,255,255,0.04);
-                border: 1px solid rgba(255,255,255,0.14);
-                border-radius: 12px;
-                padding: 0;
-            }}
-            QPushButton:hover {{
-                background: {with_alpha(VIOLET, 0.10)};
-                border-color: {with_alpha(VIOLET, 0.42)};
-            }}
-            QPushButton:pressed {{
-                background: {with_alpha(VIOLET, 0.16)};
-                border-color: {with_alpha(VIOLET, 0.56)};
-            }}
-        """)
-        b.setIconSize(QSize(18, 18))
-        self._set_media_button_icon(b, icon_name)
-        b.pressed.connect(lambda btn=b: self._animate_media_btn(btn, down=True))
-        b.released.connect(lambda btn=b: self._animate_media_btn(btn, down=False))
-        return b
-
-    def _set_media_button_icon(self, button, icon_name: str):
-        style = QApplication.style()
-        mapping = {
-            "prev": QStyle.StandardPixmap.SP_MediaSeekBackward,
-            "play": QStyle.StandardPixmap.SP_MediaPlay,
-            "pause": QStyle.StandardPixmap.SP_MediaPause,
-            "next": QStyle.StandardPixmap.SP_MediaSeekForward,
-            "stop": QStyle.StandardPixmap.SP_MediaStop,
-        }
-        sp = mapping.get(icon_name, QStyle.StandardPixmap.SP_MediaPlay)
-        base_icon = style.standardIcon(sp)
-        size = button.iconSize()
-        src = base_icon.pixmap(size)
-        if src.isNull():
-            button.setIcon(base_icon)
-            return
-        tinted = QPixmap(src.size())
-        tinted.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(tinted)
-        painter.drawPixmap(0, 0, src)
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
-        painter.fillRect(tinted.rect(), QColor(VIOLET))
-        painter.end()
-        button.setIcon(QIcon(tinted))
-
-    def _animate_media_btn(self, btn, down):
-        anim = QPropertyAnimation(btn, b"pos", btn)
-        anim.setDuration(90)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        p = btn.pos()
-        target = p + QPoint(0, 1) if down else p - QPoint(0, 1)
-        anim.setStartValue(p)
-        anim.setEndValue(target)
-        anim.start()
-        btn._press_anim = anim
-
-    def _set_play_toggle_icon(self, media_state: str):
-        state = (media_state or "").strip().lower()
-        self._play_is_playing = state in {"playing", "active"}
-        if hasattr(self, "_play_btn") and self._play_btn is not None:
-            self._set_media_button_icon(self._play_btn, "pause" if self._play_is_playing else "play")
-
-    def _is_valid_media_session(self, media: dict) -> bool:
-        if not isinstance(media, dict):
-            return False
-        title = str(media.get("title") or "").strip()
-        artist = str(media.get("artist") or "").strip()
-        album = str(media.get("album") or "").strip()
-        if not (title or artist or album):
-            return False
-        if title.lower() in {"media", "bluetooth", "unknown"} and not (artist or album):
-            return False
-        return True
-
-    def _pick_display_media(self, current: dict, sessions: list):
-        valid = [s for s in (sessions or []) if self._is_valid_media_session(s)]
-        if not valid:
-            return None, []
-        preferred = str(self._active_media_pkg_pref or "").strip()
-        if preferred:
-            for session in valid:
-                if str(session.get("package") or "").strip() == preferred:
-                    return session, valid
-        if self._is_valid_media_session(current):
-            return current, valid
-        active = [s for s in valid if str(s.get("state") or "").strip().lower() in {"playing", "active"}]
-        return (active[0] if active else valid[0]), valid
-
-    def _rounded_pixmap(self, pixmap: QPixmap, edge: int = 56, radius: int = 18) -> QPixmap:
-        if pixmap.isNull():
-            return QPixmap()
-        scaled = pixmap.scaled(edge, edge, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-        out = QPixmap(edge, edge)
-        out.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(out)
-        path = QPainterPath()
-        path.addRoundedRect(0, 0, edge, edge, radius, radius)
-        painter.setClipPath(path)
-        painter.drawPixmap(0, 0, scaled)
-        painter.end()
-        return out
-
-    def _placeholder_media_art(self, media: dict | None, edge: int = 56, radius: int = 18) -> QPixmap:
-        out = QPixmap(edge, edge)
-        out.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(out)
-        path = QPainterPath()
-        path.addRoundedRect(0, 0, edge, edge, radius, radius)
-        painter.setClipPath(path)
-        base = QColor(30, 42, 68)
-        accent = QColor(86, 112, 176)
-        painter.fillRect(0, 0, edge, edge, base)
-        painter.fillRect(0, int(edge * 0.55), edge, int(edge * 0.45), accent)
-        painter.setPen(QColor(220, 228, 245))
-        marker = "▶"
-        if isinstance(media, dict):
-            title = str(media.get("title") or "").strip()
-            if title:
-                marker = title[0].upper()
-        painter.drawText(out.rect(), Qt.AlignmentFlag.AlignCenter, marker)
-        painter.end()
-        return out
-
-    def _set_now_playing_artwork(self, media: dict | None):
-        art_path = ""
-        if isinstance(media, dict):
-            for key in ("artwork", "art", "album_art", "art_path", "cover_path", "display_icon_uri", "media_uri"):
-                val = str(media.get(key) or "").strip()
-                if val and os.path.exists(val):
-                    art_path = val
-                    break
-        if art_path:
-            pix = QPixmap(art_path)
-            rounded = self._rounded_pixmap(pix)
-            if not rounded.isNull():
-                self._np_art.setText("")
-                self._np_art.setPixmap(rounded)
-                self._np_art.setStyleSheet("""
-                    QLabel {
-                        background: transparent;
-                        border: none;
-                    }
-                """)
-                return
-        if isinstance(media, dict) and (media.get("title") or media.get("package") or media.get("session_name")):
-            self._np_art.setText("")
-            self._np_art.setPixmap(self._placeholder_media_art(media))
-            self._np_art.setStyleSheet("""
-                QLabel {
-                    background: transparent;
-                    border: none;
-                }
-            """)
-            return
-        self._np_art.setPixmap(QPixmap())
-        self._np_art.setText("♪")
-        self._np_art.setStyleSheet(f"""
-            QLabel {{
-                background: rgba(255,255,255,0.05);
-                border: 1px solid rgba(255,255,255,0.14);
-                border-radius: 18px;
-                color: {TEXT_DIM};
-                font-size: 20px;
-                font-weight: 700;
-            }}
-        """)
 
     def _stat(self, label_text, val, color, sub):
         f = card_frame(hover=False)
@@ -655,75 +320,6 @@ class DashboardPage(QWidget):
         bar_fill.setFixedWidth(60)
         fl.addWidget(bar_bg)
         return f, val_lbl, sub_lbl, bar_fill
-
-    def _conn_row(self, ico, name, sub, on, color, on_toggle=None):
-        w = QWidget()
-        w.setStyleSheet("background:transparent;border:none;")
-        row = QHBoxLayout(w)
-        row.setContentsMargins(20,11,20,11)
-        row.setSpacing(12)
-        row.addWidget(lbl(ico, 18))
-        info = QVBoxLayout()
-        info.setSpacing(2)
-        info.addWidget(lbl(name, 13, TEXT, bold=True))
-        sub_lbl = lbl(sub, 11, TEXT_DIM)
-        info.addWidget(sub_lbl)
-        row.addLayout(info)
-        row.addStretch()
-        t = toggle_switch(on, color)
-        if on_toggle:
-            t.toggled.connect(on_toggle)
-        row.addWidget(t)
-        w._toggle = t
-        w._sub = sub_lbl
-        return w
-
-    def _set_conn_row_state(self, row, enabled, detail=None):
-        if hasattr(row, "_toggle"):
-            try:
-                row._toggle.blockSignals(True)
-                row._toggle.setChecked(bool(enabled))
-                row._toggle.blockSignals(False)
-            except RuntimeError:
-                pass
-        if detail is not None and hasattr(row, "_sub"):
-            try:
-                row._sub.setText(str(detail))
-            except RuntimeError:
-                pass
-
-    def _set_pill(self, widget, text, color):
-        if widget is None:
-            return
-        widget.setStyleSheet(
-            f"""
-            QWidget {{
-                color:{color};
-                background:transparent;
-                border:none;
-                border-radius:0px;
-            }}
-        """
-        )
-        txt = getattr(widget, "_text_label", None)
-        if txt is not None:
-            txt.setText(text)
-            txt.setStyleSheet(
-                f"font-size:10px;font-family:monospace;background:transparent;border:none;color:{color};"
-            )
-        dot = getattr(widget, "_dot_widget", None)
-        if dot is not None:
-            dot.setStyleSheet(f"background:{color};border:none;border-radius:3px;")
-
-    def _set_status_pill(self, widget, label, state_name):
-        state_map = {
-            "connected": (TEXT_MID, "Connected"),
-            "connecting": (TEXT_DIM, "Checking"),
-            "degraded": (AMBER, "Degraded"),
-            "disconnected": (TEXT_DIM, "Offline"),
-        }
-        color, suffix = state_map.get(state_name, state_map["disconnected"])
-        self._set_pill(widget, f"{label} · {suffix}", color)
 
     def refresh(self, *, force_media: bool = False):
         if self._refresh_busy:
@@ -762,11 +358,7 @@ class DashboardPage(QWidget):
         return last is not None and bool(last) == bool(target)
 
     def _set_row_busy(self, row, busy):
-        if hasattr(row, "_toggle"):
-            try:
-                row._toggle.setEnabled(not busy)
-            except RuntimeError:
-                pass
+        set_conn_row_busy(row, busy)
 
     def _on_connectivity_ops_busy(self, payload):
         row_map = {
@@ -804,7 +396,7 @@ class DashboardPage(QWidget):
     def _finish_toggle(self, row, ok, msg, actual, fallback_label):
         self._set_row_busy(row, False)
         if actual is not None:
-            self._set_conn_row_state(row, bool(actual))
+            set_conn_row_state(row, bool(actual))
         if ok:
             push_toast(msg or "Updated", "success", 1700)
         else:
@@ -820,6 +412,14 @@ class DashboardPage(QWidget):
         kde_enabled = bool((data or {}).get("kde_enabled", True))
         kde_reachable = bool((data or {}).get("kde_reachable", False))
         kde_status = str((data or {}).get("kde_status") or ("reachable" if kde_reachable else ("disabled" if not kde_enabled else "unreachable")))
+        kde_health = state.get("kde_health", {}) or {}
+        kde_health_status = str(kde_health.get("status") or "").strip().lower()
+        kde_health_reachable = kde_health.get("reachable")
+        if kde_enabled:
+            if kde_health_status == "ok" or kde_health_reachable is True:
+                kde_status = "reachable"
+            elif kde_status == "unknown" and kde_health_status == "degraded":
+                kde_status = "unreachable"
         syncthing_service_active = bool((data or {}).get("syncthing_service_active", False))
         syncthing_api_reachable = bool((data or {}).get("syncthing_api_reachable", False))
         syncthing_reason = str((data or {}).get("syncthing_reason") or "unknown")
@@ -829,20 +429,20 @@ class DashboardPage(QWidget):
             or ((not syncthing_service_active) and syncthing_api_reachable)
         )
 
-        self._set_status_pill(
+        set_status_pill(
             self._ts_pill,
             "Tailscale",
             "connected" if tailscale_on else ("connecting" if self._toggle_worker is not None else "disconnected"),
         )
-        self._set_status_pill(
+        set_status_pill(
             self._kde_pill,
             "KDE Connect",
             "connected" if kde_status == "reachable"
             else "disconnected" if kde_status == "disabled"
-            else "degraded" if kde_status == "unknown"
+            else "degraded" if kde_status == "unreachable"
             else "connecting",
         )
-        self._set_status_pill(
+        set_status_pill(
             self._sync_pill,
             "Syncthing",
             "connected" if syncthing_effective_connected
@@ -856,7 +456,7 @@ class DashboardPage(QWidget):
             "reachable": "reachable",
             "unreachable": "offline",
             "disabled": "disabled",
-            "unknown": "unknown",
+            "unknown": "checking",
         }.get(kde_status, "unknown")
         self._device_sub_lbl.setText(
             f"{tailscale_detail} · KDE {_kde_label} · "
@@ -865,7 +465,7 @@ class DashboardPage(QWidget):
 
         if syncthing_service_active and (not syncthing_api_reachable):
             self._net_card[2].setText(f"Syncthing API degraded ({syncthing_reason})")
-        elif (not syncthing_service_active) and syncthing_api_reachable and syncthing_unit_file_state == "masked":
+        elif (not syncthing_service_active) and syncthing_api_reachable:
             self._net_card[2].setText("Syncthing API up (external instance)")
 
         bat = (data or {}).get("battery") or {}
@@ -894,14 +494,14 @@ class DashboardPage(QWidget):
             self._sig_card[2].setText(bars)
         wifi_enabled = (data or {}).get("wifi_enabled")
         if wifi_enabled is None:
-            self._set_conn_row_state(self._wifi_row, False, "Unknown (phone unreachable)")
+            set_conn_row_state(self._wifi_row, False, "Unknown (phone unreachable)")
         else:
-            self._set_conn_row_state(self._wifi_row, bool(wifi_enabled), "Phone Wi-Fi radio")
+            set_conn_row_state(self._wifi_row, bool(wifi_enabled), "Phone Wi-Fi radio")
         bt_enabled = (data or {}).get("bt_enabled")
         if bt_enabled is None:
-            self._set_conn_row_state(self._bt_row, False, "Unknown (phone unreachable)")
+            set_conn_row_state(self._bt_row, False, "Unknown (phone unreachable)")
         else:
-            self._set_conn_row_state(self._bt_row, bool(bt_enabled), "Phone Bluetooth radio")
+            set_conn_row_state(self._bt_row, bool(bt_enabled), "Phone Bluetooth radio")
 
         self._sync_audio_route_toggle()
 
@@ -957,122 +557,6 @@ class DashboardPage(QWidget):
             return self.adb.set_hotspot_smart(target)
 
         self._run_toggle(self._hs_row, _action, "Hotspot toggle failed")
-
-    def _view_clipboard(self):
-        """Show synced phone clipboard timeline with search and source labels."""
-        from backend.state import state
-        from PyQt6.QtWidgets import (
-            QDialog,
-            QVBoxLayout,
-            QTextEdit,
-            QPushButton,
-            QHBoxLayout,
-        )
-        from PyQt6.QtCore import Qt
-        import datetime
-
-        history = sanitize_clipboard_history(state.get("clipboard_history", []) or [])
-        current = (state.get("clipboard_text", "") or "").strip() or (QApplication.clipboard().text() or "").strip()
-        d = QDialog(self)
-        d.setWindowTitle("Synced Clipboard Timeline")
-        d.setStyleSheet("background:#070c17;color:white;")
-        d.resize(760, 380)
-        lay = QVBoxLayout(d)
-        lay.addWidget(lbl("Synced Clipboard Timeline", 13, bold=True))
-        lay.addWidget(lbl("Shows clipboard items synced while PhoneBridge is active/background.", 10, TEXT_DIM))
-
-        row = QHBoxLayout()
-        row.setSpacing(10)
-
-        history_list = QListWidget()
-        history_list.setStyleSheet("""
-            QListWidget {
-                background:rgba(255,255,255,0.04);
-                border:1px solid rgba(255,255,255,0.1);
-                border-radius:10px;
-                padding:6px;
-            }
-            QListWidget::item {
-                padding:6px 8px;
-                border-radius:6px;
-            }
-            QListWidget::item:selected {
-                background:rgba(167,139,250,0.16);
-            }
-        """)
-        history_list.setMinimumWidth(300)
-        search = input_field("Filter timeline…")
-        lay.addWidget(search)
-
-        te = QTextEdit()
-        te.setPlainText(current or "(empty)")
-        te.setStyleSheet("background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:10px;color:white;padding:8px;")
-        te.setReadOnly(False)
-
-        def fill_rows(filter_text=""):
-            history_list.clear()
-            q = (filter_text or "").strip().lower()
-            for entry in reversed(history):
-                text = (entry.get("text") or "").strip()
-                if not text:
-                    continue
-                src = (entry.get("source") or "phone").upper()
-                if q and q not in text.lower() and q not in src.lower():
-                    continue
-                raw_ts = entry.get("ts")
-                try:
-                    ts = int(raw_ts or 0)
-                except Exception:
-                    ts = 0
-                # Backward compatibility: older rows may store ms timestamps.
-                if ts > 10_000_000_000:
-                    ts //= 1000
-                try:
-                    stamp = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "--:--:--"
-                except Exception:
-                    stamp = "--:--:--"
-                preview = text.replace("\n", " ")[:52]
-                item = QListWidgetItem(f"[{src}] {stamp}  {preview}")
-                item.setData(Qt.ItemDataRole.UserRole, text)
-                history_list.addItem(item)
-
-        fill_rows()
-        search.textChanged.connect(fill_rows)
-
-        def on_pick(item):
-            if not item:
-                return
-            te.setPlainText(item.data(Qt.ItemDataRole.UserRole) or "")
-
-        history_list.currentItemChanged.connect(lambda curr, _: on_pick(curr))
-        if history_list.count():
-            history_list.setCurrentRow(0)
-
-        row.addWidget(history_list)
-        row.addWidget(te, 1)
-        lay.addLayout(row)
-
-        btn_row = QHBoxLayout()
-        sync_btn = action_btn("Push to Phone", TEAL)
-        def push_selected():
-            QApplication.clipboard().setText(te.toPlainText())
-            self.kc.send_clipboard_to_phone()
-        sync_btn.clicked.connect(push_selected)
-        copy_btn = action_btn("Copy to PC", CYAN)
-        def copy_to_laptop():
-            QApplication.clipboard().setText(te.toPlainText())
-        clear_btn = action_btn("Clear History", ROSE)
-        def clear_history():
-            settings.set("clipboard_history", [])
-            state.set("clipboard_history", [])
-            history_list.clear()
-        copy_btn.clicked.connect(copy_to_laptop)
-        clear_btn.clicked.connect(clear_history)
-        btn_row.addWidget(sync_btn)
-        btn_row.addWidget(copy_btn)
-        btn_row.addWidget(clear_btn)
-        lay.addLayout(btn_row)
-        d.exec()
 
     def _go_mirror(self):
         window = self.window()
@@ -1219,53 +703,3 @@ class DashboardPage(QWidget):
         settings.set("dnd_active", actual_bool)
         if self._dnd_btn:
             self._dnd_btn.setChecked(actual_bool)
-
-    def _media_cmd(self, action):
-        target_pkg = str(self._active_media_pkg_pref or self._now_playing_pkg or "")
-        if target_pkg and target_pkg != self._now_playing_pkg and action in {"prev", "toggle", "next"}:
-            self.adb.launch_app(target_pkg)
-        if action == "prev":
-            self.adb.media_prev()
-        elif action == "toggle":
-            self.adb.media_play_pause()
-            self._play_is_playing = not self._play_is_playing
-            if hasattr(self, "_play_btn") and self._play_btn is not None:
-                self._set_media_button_icon(self._play_btn, "pause" if self._play_is_playing else "play")
-        elif action == "next":
-            self.adb.media_next()
-        elif action == "kill":
-            self.adb.stop_media_app(target_pkg)
-        QTimer.singleShot(250, lambda: self.refresh(force_media=True))
-
-    def _sync_player_switch_button(self):
-        count = len(self._media_sessions or [])
-        self._player_switch_btn.setEnabled(count > 1)
-        self._player_switch_btn.setText("➜" if count > 1 else "•")
-
-    def _show_player_switch_menu(self):
-        sessions = list(self._media_sessions or [])
-        if len(sessions) <= 1:
-            return
-        menu = QMenu(self)
-        menu.setStyleSheet(
-            "QMenu { background:#13161d; border:1px solid #252b3b; color:#dde3f0; }"
-            "QMenu::item { padding:7px 12px; }"
-            "QMenu::item:selected { background:rgba(124,108,255,0.22); }"
-        )
-        current_pkg = self._active_media_pkg_pref or self._now_playing_pkg
-        for session in sessions:
-            pkg = str(session.get("package") or "")
-            title = str(session.get("title") or session.get("session_name") or pkg or "Unknown")
-            artist = str(session.get("artist") or "")
-            label = title if not artist else f"{title} — {artist}"
-            action = menu.addAction(label)
-            action.setCheckable(True)
-            action.setChecked(bool(pkg and pkg == current_pkg))
-            action.triggered.connect(lambda _, p=pkg: self._select_media_player(p))
-        menu.exec(self._player_switch_btn.mapToGlobal(self._player_switch_btn.rect().bottomRight()))
-
-    def _select_media_player(self, package_name: str):
-        self._active_media_pkg_pref = str(package_name or "")
-        if self._active_media_pkg_pref:
-            self.adb.launch_app(self._active_media_pkg_pref)
-        self.refresh(force_media=True)

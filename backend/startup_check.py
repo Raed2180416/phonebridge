@@ -325,8 +325,13 @@ class StartupCheckPopup(QWidget):
         self.adjustSize()
         screen = QApplication.primaryScreen().availableGeometry()
         if anchor_pos is not None:
-            x = int(anchor_pos.x() - self.width() + 18)
-            y = int(anchor_pos.y() - self.height() - 8)
+            if mode == "tray":
+                # Tray behavior: open as a side-extension panel from the tray icon.
+                x = int(anchor_pos.x() - self.width() - 12)
+                y = int(anchor_pos.y() - (self.height() // 2))
+            else:
+                x = int(anchor_pos.x() - self.width() + 18)
+                y = int(anchor_pos.y() - self.height() - 8)
             x = max(screen.x() + 8, min(x, screen.right() - self.width() - 8))
             y = max(screen.y() + 8, min(y, screen.bottom() - self.height() - 8))
             self.move(x, y)
@@ -447,7 +452,7 @@ class StartupCheckPopup(QWidget):
     def _open_app(self):
         self._user_interacted = True
         if self.main_window is not None and hasattr(self.main_window, "show_and_raise"):
-            self.main_window.show_and_raise()
+            self.main_window.show_and_raise(reason="startup_check:open_app")
         self.hide_popup()
 
     def hide_popup(self):

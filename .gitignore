@@ -30,7 +30,9 @@ docs/audit/evidence/latest
 docs/audit/evidence/runs/
 
 # Hardware/local test outputs
-optional_tests/hardware_call_mic_report.json
+tests/hardware/call_mic_report.json
+tests/hardware/.artifacts/
+tests/hardware/.live_acceptance_*/
 
 # Socket created by PhoneBridge
 /tmp/phonebridge-*.sock

@@ -11,6 +11,7 @@ import time
 
 from backend.state import state
 from backend.kdeconnect import KDEConnect
+from backend.notifications_state import record_dismissed
 
 try:
     import dbus  # type: ignore
@@ -139,35 +140,54 @@ class NotificationMirror:
             self._desktop_to_phone[notif_id] = phone_id
             self._phone_hash[phone_id] = new_hash
             self._phone_payload[phone_id] = dict(payload or {})
+        log.info(
+            "Mirrored notification phone_id=%s desktop_id=%s app=%s title=%s",
+            phone_id,
+            notif_id,
+            app_name,
+            summary,
+        )
 
     @staticmethod
     def _normalize_actions(payload: dict) -> list[str]:
         p = dict(payload or {})
         raw = list(p.get("actions") or [])
-        # Already freedesktop style: [key, label, key, label...]
-        if len(raw) % 2 == 0 and all(isinstance(x, str) for x in raw):
-            out: list[str] = [str(x) for x in raw]
-        else:
-            out = []
-            for entry in raw:
-                if isinstance(entry, dict):
-                    key = str(entry.get("key") or entry.get("id") or "").strip()
-                    label = str(entry.get("label") or entry.get("title") or key).strip()
-                    if key:
-                        out.extend([key, label or key])
-                    continue
-                key = str(entry or "").strip()
-                if not key:
-                    continue
-                label = key.replace("_", " ").replace("-", " ").strip().title()
-                out.extend([key, label or key])
-        # Fallback actions for notifications that don't expose rich actions.
+        supports_explicit = bool(p.get("actions_supported", bool(raw)))
+        out: list[str] = []
+        if supports_explicit:
+            # Already freedesktop style: [key, label, key, label...]
+            if len(raw) % 2 == 0 and all(isinstance(x, str) for x in raw):
+                out.extend(str(x) for x in raw)
+            else:
+                for entry in raw:
+                    if isinstance(entry, dict):
+                        key = str(entry.get("key") or entry.get("id") or "").strip()
+                        label = str(entry.get("label") or entry.get("title") or key).strip()
+                        if key:
+                            out.extend([key, label or key])
+                        continue
+                    key = str(entry or "").strip()
+                    if not key:
+                        continue
+                    label = key.replace("_", " ").replace("-", " ").strip().title()
+                    out.extend([key, label or key])
+        # PhoneBridge-reliable actions for unpatched KDE notification metadata.
+        out = ["default", "Open PhoneBridge"] + out
         if str(p.get("replyId") or "").strip():
             out.extend(["__pb_reply", "Reply"])
         text = str(p.get("text") or p.get("title") or "").strip()
         if text:
             out.extend(["__pb_copy", "Copy"])
-        return out
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for i in range(0, len(out), 2):
+            key = str(out[i] if i < len(out) else "").strip()
+            label = str(out[i + 1] if i + 1 < len(out) else key).strip() or key
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.extend([key, label])
+        return deduped
 
     def close_for_phone(self, phone_id: str) -> None:
         if self._iface is None and not self._ensure_ready():
@@ -180,6 +200,11 @@ class NotificationMirror:
             self._phone_payload.pop(str(phone_id), None)
             self._phone_hash.pop(str(phone_id), None)
             self._closing_desktop_ids.add(int(desktop_id))
+        log.info(
+            "Closing mirrored notification phone_id=%s desktop_id=%s origin=phone_removed",
+            phone_id,
+            desktop_id,
+        )
         try:
             self._iface.CloseNotification(dbus.UInt32(int(desktop_id)))
         except Exception:
@@ -203,6 +228,7 @@ class NotificationMirror:
                 self._closing_desktop_ids.discard(did)
                 return
             phone_id = self._desktop_to_phone.pop(did, None)
+            payload = dict(self._phone_payload.get(str(phone_id), {}) if phone_id else {})
             if phone_id:
                 self._phone_to_desktop.pop(phone_id, None)
                 self._phone_payload.pop(phone_id, None)
@@ -210,16 +236,29 @@ class NotificationMirror:
 
         if not phone_id:
             return
-        # 2 = dismissed by user, 1 = expired by server timeout.
-        if why not in {1, 2}:
+        # 1 = expired by server timeout, 2 = dismissed by user,
+        # 3 = closed by an external desktop-side CloseNotification call.
+        if why not in {1, 2, 3}:
             return
+        log.info(
+            "Desktop notification closed desktop_id=%s phone_id=%s reason=%s",
+            did,
+            phone_id,
+            why,
+        )
         try:
             self._kc.dismiss_notification(phone_id)
         except Exception:
             pass
-        rows = list(state.get("notifications", []) or [])
-        rows = [r for r in rows if str((r or {}).get("id") or "") != str(phone_id)]
-        state.set("notifications", rows)
+        try:
+            record_dismissed(str(phone_id), payload)
+        except Exception:
+            pass
+        state.update(
+            "notifications",
+            lambda rows: [r for r in rows if str((r or {}).get("id") or "") != str(phone_id)],
+            default=[],
+        )
         state.set("notif_revision", {"id": str(phone_id), "updated_at": int(time.time() * 1000)})
 
     def _on_action_invoked(self, desktop_id, action_key):
@@ -234,6 +273,19 @@ class NotificationMirror:
             phone_id = self._desktop_to_phone.get(did)
             payload = dict(self._phone_payload.get(str(phone_id), {}) if phone_id else {})
         if not phone_id:
+            return
+        log.info(
+            "Desktop notification action desktop_id=%s phone_id=%s action=%s",
+            did,
+            phone_id,
+            action,
+        )
+        if action == "default":
+            state.set(
+                "notif_open_request",
+                {"id": str(phone_id), "source": "desktop_notification", "ts_ms": int(time.time() * 1000)},
+            )
+            state.set("notif_revision", {"id": str(phone_id), "updated_at": int(time.time() * 1000)})
             return
         if action == "__pb_copy":
             self._copy_notification_text(payload)
@@ -267,6 +319,12 @@ class NotificationMirror:
         reply_id = str(payload.get("replyId") or "").strip()
         if not reply_id:
             return
+        log.info(
+            "Desktop notification reply desktop_id=%s phone_id=%s text_len=%s",
+            did,
+            phone_id,
+            len(text),
+        )
         try:
             self._kc.reply_notification(reply_id, text)
         except Exception:

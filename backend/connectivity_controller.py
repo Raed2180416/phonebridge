@@ -25,9 +25,11 @@ _LOCKS = {
 
 
 def _set_busy(op: str, busy: bool) -> None:
-    current = dict(state.get("connectivity_ops_busy", {}) or {})
-    current[op] = bool(busy)
-    state.set("connectivity_ops_busy", current)
+    def _update(current):
+        current[op] = bool(busy)
+        return current
+
+    state.update("connectivity_ops_busy", _update, default={})
 
 
 def _try_begin(op: str) -> threading.Lock | None:
@@ -61,6 +63,19 @@ def _wait_for_bool(getter, target: bool, timeout_s: float = 3.5, step_s: float =
     if last is None:
         return False, None
     return bool(last) == bool(target), bool(last)
+
+
+def _publish_syncthing_runtime_status(status: dict, op: str) -> None:
+    payload = {
+        "service_active": bool((status or {}).get("service_active", False)),
+        "api_reachable": bool((status or {}).get("api_reachable", False)),
+        "unit_state": str((status or {}).get("unit_state") or "unknown"),
+        "unit_file_state": str((status or {}).get("unit_file_state") or "unknown"),
+        "reason": str((status or {}).get("reason") or "unknown"),
+        "op": str(op or "unknown"),
+        "updated_at": int(time.time() * 1000),
+    }
+    state.set("syncthing_runtime_status", payload)
 
 
 def set_wifi(enabled: bool, target: str | None = None):
@@ -261,25 +276,50 @@ def set_syncthing(enabled: bool):
     try:
         desired = bool(enabled)
         st = Syncthing()
-        cmd_ok = bool(st.set_running(desired))
-        actual_ok, actual = _wait_for_bool(st.is_service_active, desired, timeout_s=4.0, step_s=0.4)
-        status = st.get_runtime_status(timeout=3)
-        if not actual_ok:
-            return (
-                False,
-                f"Syncthing service did not reach requested state ({status.get('unit_state', 'unknown')})",
-                bool(status.get("service_active", False)),
-            )
-        if desired and not bool(status.get("api_reachable", False)):
+        if desired:
+            cmd_ok = bool(st.set_running(True))
+            status = st.get_runtime_status(timeout=3)
+            _publish_syncthing_runtime_status(status, "enable")
+            api_up = bool(status.get("api_reachable", False))
+            if not api_up:
+                return (
+                    bool(cmd_ok),
+                    f"Syncthing API unreachable ({status.get('api_reason', 'unknown')})",
+                    False,
+                )
             return (
                 bool(cmd_ok),
-                f"Syncthing service active; API unreachable ({status.get('api_reason', 'unknown')})",
+                "Syncthing reachable",
+                True,
+            )
+
+        # Disable path: stop managed service first.
+        cmd_ok = bool(st.set_running(False))
+        status = st.get_runtime_status(timeout=3)
+        api_up = bool(status.get("api_reachable", False))
+
+        # If API is still reachable, this is likely an external instance.
+        # Request graceful shutdown through the REST API.
+        shutdown_ok = True
+        if api_up:
+            shutdown_ok = bool(st.shutdown_api(timeout=6))
+            _wait_for_bool(lambda: st.ping_status(timeout=2)[0], False, timeout_s=6.0, step_s=0.4)
+            status = st.get_runtime_status(timeout=3)
+            api_up = bool(status.get("api_reachable", False))
+
+        _publish_syncthing_runtime_status(status, "disable")
+
+        effective_connected = bool(api_up)
+        if effective_connected:
+            return (
+                False,
+                "Syncthing API still reachable (external instance did not stop)",
                 True,
             )
         return (
-            bool(cmd_ok),
-            ("Syncthing service active" if desired else "Syncthing service stopped"),
-            bool(status.get("service_active", False)),
+            bool(cmd_ok and shutdown_ok),
+            "Syncthing stopped",
+            False,
         )
     finally:
         _end("syncthing", lock)

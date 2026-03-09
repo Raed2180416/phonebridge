@@ -6,6 +6,7 @@ import logging
 import subprocess
 
 import backend.autostart as autostart
+from backend import hyprland
 import backend.settings_store as settings
 
 log = logging.getLogger(__name__)
@@ -26,6 +27,30 @@ ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
   <path d="M48 48h32M48 62h32M48 76h24" stroke="#b8c3d9" stroke-width="4" stroke-linecap="round"/>
 </svg>
 """
+
+
+def desktop_entry_path() -> Path:
+    return Path.home() / ".local" / "share" / "applications" / f"{APP_ID}.desktop"
+
+
+def desktop_entry_contents(project_root: Path) -> str:
+    exec_path = autostart.preferred_launcher(project_root)
+    icon_name = APP_ID
+    return (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Version=1.0\n"
+        "Name=PhoneBridge\n"
+        "Comment=Phone control center for desktop\n"
+        f"Exec={exec_path}\n"
+        f"TryExec={exec_path}\n"
+        f"Icon={icon_name}\n"
+        "StartupWMClass=phonebridge\n"
+        "X-GNOME-WMClass=phonebridge\n"
+        "Terminal=false\n"
+        "Categories=Utility;Network;\n"
+        "StartupNotify=true\n"
+    )
 
 
 def _run(cmd: list[str]) -> tuple[bool, str]:
@@ -53,22 +78,8 @@ def _write_if_changed(path: Path, content: str) -> bool:
 
 
 def ensure_desktop_entry(project_root: Path) -> tuple[bool, str]:
-    desktop_path = Path.home() / ".local" / "share" / "applications" / f"{APP_ID}.desktop"
-    exec_path = project_root / "run-venv-nix.sh"
-    icon_name = APP_ID
-    content = (
-        "[Desktop Entry]\n"
-        "Type=Application\n"
-        "Version=1.0\n"
-        "Name=PhoneBridge\n"
-        "Comment=Phone control center for desktop\n"
-        f"Exec={exec_path}\n"
-        f"TryExec={exec_path}\n"
-        f"Icon={icon_name}\n"
-        "Terminal=false\n"
-        "Categories=Utility;Network;\n"
-        "StartupNotify=true\n"
-    )
+    desktop_path = desktop_entry_path()
+    content = desktop_entry_contents(project_root)
     changed = _write_if_changed(desktop_path, content)
     if changed:
         desktop_path.chmod(0o755)
@@ -76,11 +87,23 @@ def ensure_desktop_entry(project_root: Path) -> tuple[bool, str]:
     return True, str(desktop_path)
 
 
+def refresh_desktop_entry_if_present(project_root: Path) -> tuple[bool, str]:
+    desktop_path = desktop_entry_path()
+    should_refresh = desktop_path.exists() or bool(settings.get("integration_manage_desktop_entry", False))
+    if not should_refresh:
+        return False, "Desktop entry absent and auto-management disabled"
+    return ensure_desktop_entry(project_root)
+
+
 def ensure_icon() -> tuple[bool, str]:
     icon_path = Path.home() / ".local" / "share" / "icons" / "hicolor" / "scalable" / "apps" / f"{APP_ID}.svg"
     _write_if_changed(icon_path, ICON_SVG)
     _run(["gtk-update-icon-cache", "-f", "-t", str(icon_path.parents[2])])
     return True, str(icon_path)
+
+
+def ensure_hyprland_call_popup_rules() -> tuple[bool, str]:
+    return hyprland.ensure_call_popup_rules()
 
 
 def ensure_hyprland_toggle_binding(project_root: Path) -> tuple[bool, str]:
@@ -93,33 +116,84 @@ def ensure_hyprland_toggle_binding(project_root: Path) -> tuple[bool, str]:
     if toggle_script.exists():
         toggle_cmd = f"{toggle_script}"
     else:
-        # Fallback for older checkouts that don't yet have the fast relay script.
-        toggle_cmd = f"{project_root / 'run-venv-nix.sh'} --toggle"
-    bind_lines = [
-        f"bind = SUPER, P, exec, {toggle_cmd}\n",
-    ]
+        toggle_cmd = f"{autostart.preferred_launcher(project_root)} --toggle"
+
+    # Check if Home Manager / NixOS already declares a SUPER+P phonebridge
+    # keybind in hyprland.conf.
+    main_already_has_bind = False
+    main_text = ""
+    if main_conf.exists():
+        try:
+            main_text = main_conf.read_text(encoding="utf-8")
+        except OSError as exc:
+            return False, f"Cannot read Hyprland config ({exc}); skipped SUPER+P binding"
+        for line in main_text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if "SUPER" in stripped and ", P," in stripped and "phonebridge" in stripped:
+                main_already_has_bind = True
+                break
+
+    if main_already_has_bind:
+        # External config manages keybind. Clean up our managed file if present.
+        if bind_conf.exists():
+            try:
+                bind_conf.unlink()
+            except OSError:
+                pass
+        # Clean up source line if present.
+        if HYPR_INCLUDE_LINE in main_text:
+            try:
+                main_conf.write_text(
+                    main_text.replace(HYPR_INCLUDE_LINE, ""),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass  # Read-only (Nix store) is fine
+        # Always inject call-popup windowrules via IPC.
+        ensure_hyprland_call_popup_rules()
+        return True, "SUPER+P keybind already managed by system config; skipped"
+
+    # Write our own keybind config file.
     bind_content = (
         "# Managed by PhoneBridge\n"
-        + "".join(bind_lines)
+        f"bind = SUPER, P, exec, {toggle_cmd}\n"
     )
     _write_if_changed(bind_conf, bind_content)
 
-    if main_conf.exists():
+    if main_conf.exists() and HYPR_INCLUDE_LINE not in main_text:
         try:
-            text = main_conf.read_text(encoding="utf-8")
+            main_conf.write_text(
+                main_text.rstrip() + "\n\n" + HYPR_INCLUDE_LINE,
+                encoding="utf-8",
+            )
         except OSError as exc:
-            return False, f"Cannot read Hyprland config ({exc}); skipped SUPER+P binding"
-        if HYPR_INCLUDE_LINE not in text:
-            try:
-                main_conf.write_text(text.rstrip() + "\n\n" + HYPR_INCLUDE_LINE, encoding="utf-8")
-            except OSError as exc:
-                return False, f"Cannot update Hyprland config ({exc}); skipped SUPER+P binding"
-    _run(["hyprctl", "reload"])
+            log.debug("Cannot update Hyprland config: %s", exc)
+
+    _hyprctl_reload()
+    # Always inject call-popup windowrules via IPC.
+    ensure_hyprland_call_popup_rules()
     return True, str(bind_conf)
 
 
+def _hyprctl_reload():
+    """Reload Hyprland config via IPC socket (works inside bwrap)."""
+    hyprland.reload_config()
+
+
+def _hyprland_socket_path() -> str | None:
+    """Backward-compatible socket-path wrapper."""
+    return hyprland.socket_path()
+
+
+def _hyprland_ipc(sock_path: str, command: bytes) -> str:
+    """Backward-compatible IPC wrapper."""
+    return hyprland.ipc(command, sock_path=sock_path)
+
+
 def disable_desktop_entry() -> tuple[bool, str]:
-    desktop_path = Path.home() / ".local" / "share" / "applications" / f"{APP_ID}.desktop"
+    desktop_path = desktop_entry_path()
     try:
         if desktop_path.exists():
             desktop_path.unlink()
@@ -151,7 +225,7 @@ def disable_hyprland_toggle_binding() -> tuple[bool, str]:
             text = main_conf.read_text(encoding="utf-8")
             if HYPR_INCLUDE_LINE in text:
                 main_conf.write_text(text.replace(HYPR_INCLUDE_LINE, ""), encoding="utf-8")
-        _run(["hyprctl", "reload"])
+        _hyprctl_reload()
         return True, "Hyprland PhoneBridge bind management disabled"
     except OSError as exc:
         return False, f"Could not disable Hyprland bind management ({exc})"

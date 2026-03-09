@@ -1,11 +1,11 @@
 """Network page — Tailscale, KDE Connect, Syncthing, Bluetooth, Hotspot"""
+from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
     QFrame,
 )
-from PyQt6.QtCore import QThread, pyqtSignal
 import time
 
 from ui.theme import (
@@ -28,6 +28,14 @@ from backend.ui_feedback import push_toast
 from backend.state import state
 import backend.settings_store as settings
 import backend.connectivity_controller as connectivity
+from backend.connectivity_snapshot import collect_snapshot
+from ui.pages.connectivity_widgets import (
+    ToggleActionWorker,
+    build_conn_row,
+    set_conn_row_busy,
+    set_conn_row_detail,
+    set_conn_toggle_state,
+)
 
 
 class NetworkRefreshWorker(QThread):
@@ -47,6 +55,7 @@ class NetworkRefreshWorker(QThread):
             "tailscale_mesh_ready": False,
             "kde": bool(settings.get("kde_integration_enabled", True)),
             "kde_reachable": False,
+            "kde_status": "unknown",
             "syncthing": False,
             "syncthing_service_active": False,
             "syncthing_api_reachable": False,
@@ -56,136 +65,9 @@ class NetworkRefreshWorker(QThread):
             "connectivity_status": {},
         }
         try:
-            ts = Tailscale()
-            if settings.get("tailscale_force_off", False) and ts.is_connected():
-                ts.down()
-
-            adb = ADBBridge(self._target)
-            st = Syncthing()
-            kc = KDEConnect()
-
-            try:
-                snapshot = ts.get_mesh_snapshot(
-                    phone_name=settings.get("device_name", ""),
-                    phone_ip=settings.get("phone_tailscale_ip", ""),
-                )
-            except Exception:
-                snapshot = {}
-
-            backend_state = str(snapshot.get("backend_state") or "").strip()
-            local_connected = bool(snapshot.get("local_connected", False))
-            mesh_ready = bool(snapshot.get("mesh_ready", False))
-            mesh_reason = str(snapshot.get("mesh_reason") or "")
-            self_ip = snapshot.get("self_ip") if local_connected else None
-            peers = list(snapshot.get("peers", []) or [])
-
-            kde_enabled = bool(settings.get("kde_integration_enabled", True))
-            try:
-                _raw = kc.is_reachable() if kde_enabled else None
-                kde_reachable = _raw is True
-                kde_status = (
-                    "disabled" if not kde_enabled
-                    else "reachable" if _raw is True
-                    else "unreachable" if _raw is False
-                    else "unknown"
-                )
-            except Exception:
-                kde_reachable = False
-                kde_status = "unknown"
-
-            try:
-                syncthing_status = st.get_runtime_status(timeout=3)
-            except Exception:
-                syncthing_status = {
-                    "service_active": False,
-                    "api_reachable": False,
-                    "reason": "status_unavailable",
-                    "unit_state": "unknown",
-                    "unit_file_state": "unknown",
-                }
-            syncthing_service_active = bool(syncthing_status.get("service_active", False))
-            syncthing_api_reachable = bool(syncthing_status.get("api_reachable", False))
-            syncthing_reason = str(syncthing_status.get("reason") or "unknown")
-            syncthing_unit_state = str(syncthing_status.get("unit_state") or "unknown")
-            syncthing_unit_file_state = str(syncthing_status.get("unit_file_state") or "unknown")
-
-            try:
-                wifi = adb.get_wifi_enabled()
-            except Exception:
-                wifi = None
-            try:
-                bt = adb.get_bluetooth_enabled()
-            except Exception:
-                bt = None
-
-            payload = {
-                "self_ip": self_ip,
-                "tailscale_state": backend_state or "unknown",
-                "tailscale_mesh_reason": mesh_reason or "mesh unavailable",
-                "peers": peers,
-                "tailscale": bool(local_connected),
-                "tailscale_mesh_ready": bool(mesh_ready),
-                "kde": kde_enabled,
-                "kde_reachable": kde_reachable,
-                "kde_status": kde_status,
-                "syncthing": syncthing_service_active,
-                "syncthing_service_active": syncthing_service_active,
-                "syncthing_api_reachable": syncthing_api_reachable,
-                "syncthing_reason": syncthing_reason,
-                "wifi_enabled": wifi,
-                "bt_enabled": bt,
-                "connectivity_status": {
-                    "tailscale": {
-                        "actual": bool(local_connected),
-                        "reachable": bool(mesh_ready),
-                        "reason": mesh_reason or f"state={backend_state or 'unknown'}",
-                    },
-                    "kde": {
-                        "actual": kde_enabled,
-                        "reachable": kde_reachable,
-                        "reason": kde_status,
-                    },
-                    "syncthing": {
-                        "actual": syncthing_service_active,
-                        "reachable": syncthing_api_reachable,
-                        "reason": f"{syncthing_reason} (unit={syncthing_unit_state}, file={syncthing_unit_file_state})",
-                    },
-                    "wifi": {
-                        "actual": bool(wifi) if wifi is not None else False,
-                        "reachable": wifi is not None,
-                        "reason": "ok" if wifi is not None else "unknown",
-                    },
-                    "bluetooth": {
-                        "actual": bool(bt) if bt is not None else False,
-                        "reachable": bt is not None,
-                        "reason": "ok" if bt is not None else "unknown",
-                    },
-                },
-            }
+            payload = collect_snapshot(target=self._target)
         finally:
             self.done.emit(payload)
-
-
-class ToggleActionWorker(QThread):
-    done = pyqtSignal(bool, str, object)
-
-    def __init__(self, action):
-        super().__init__()
-        self._action = action
-
-    def run(self):
-        try:
-            out = self._action()
-            if isinstance(out, tuple) and len(out) >= 3:
-                ok, msg, actual = out[0], out[1], out[2]
-            elif isinstance(out, tuple) and len(out) == 2:
-                ok, msg = out
-                actual = None
-            else:
-                ok, msg, actual = bool(out), "", None
-        except Exception as e:
-            ok, msg, actual = False, str(e), None
-        self.done.emit(bool(ok), str(msg or ""), actual)
 
 
 class NetworkPage(QWidget):
@@ -199,7 +81,7 @@ class NetworkPage(QWidget):
         self._refresh_busy = False
         self._refresh_worker = None
         self._toggle_worker = None
-        state.subscribe("connectivity_ops_busy", self._on_connectivity_ops_busy)
+        state.subscribe("connectivity_ops_busy", self._on_connectivity_ops_busy, owner=self)
         self._build()
         self.refresh()
 
@@ -262,11 +144,11 @@ class NetworkPage(QWidget):
         pl.setContentsMargins(0, 8, 0, 8)
         pl.setSpacing(0)
 
-        self._kc_row = self._conn_toggle("⌁", "KDE Connect", "Signal bridge", True, TEAL, self._toggle_kde)
-        self._wifi_row = self._conn_toggle("⌂", "Wi-Fi", "Phone Wi-Fi radio", True, CYAN, self._toggle_wifi)
-        self._bt_row = self._conn_toggle("⌬", "Bluetooth", "Phone Bluetooth radio", True, VIOLET, self._toggle_bluetooth)
-        self._st_row = self._conn_toggle("↺", "Syncthing", "Folder sync service", True, TEAL, self._toggle_syncthing)
-        self._hs_row = self._conn_toggle("◉", "Hotspot", "Auto: USB tether (if wired) else Wi-Fi hotspot", False, CYAN, self._toggle_hotspot)
+        self._kc_row = build_conn_row("⌁", "KDE Connect", "Signal bridge", True, TEAL, self._toggle_kde, icon_size=16, margins=(18, 11, 18, 11))
+        self._wifi_row = build_conn_row("⌂", "Wi-Fi", "Phone Wi-Fi radio", True, CYAN, self._toggle_wifi, icon_size=16, margins=(18, 11, 18, 11))
+        self._bt_row = build_conn_row("⌬", "Bluetooth", "Phone Bluetooth radio", True, VIOLET, self._toggle_bluetooth, icon_size=16, margins=(18, 11, 18, 11))
+        self._st_row = build_conn_row("↺", "Syncthing", "Folder sync service", True, TEAL, self._toggle_syncthing, icon_size=16, margins=(18, 11, 18, 11))
+        self._hs_row = build_conn_row("◉", "Hotspot", "Auto: USB tether (if wired) else Wi-Fi hotspot", False, CYAN, self._toggle_hotspot, icon_size=16, margins=(18, 11, 18, 11))
 
         for i, row in enumerate([self._kc_row, self._wifi_row, self._bt_row, self._st_row, self._hs_row]):
             if i > 0:
@@ -276,46 +158,11 @@ class NetworkPage(QWidget):
         layout.addWidget(phone_frame)
         layout.addStretch()
 
-    def _conn_toggle(self, ico, name, sub, on, color, on_toggle=None):
-        w = QWidget()
-        w.setStyleSheet("background:transparent;border:none;")
-        row = QHBoxLayout(w)
-        row.setContentsMargins(18, 11, 18, 11)
-        row.setSpacing(12)
-        row.addWidget(lbl(ico, 16))
-        info = QVBoxLayout()
-        info.setSpacing(2)
-        info.addWidget(lbl(name, 13, bold=True))
-        sub_lbl = lbl(sub, 11, TEXT_DIM)
-        info.addWidget(sub_lbl)
-        row.addLayout(info)
-        row.addStretch()
-        t = toggle_switch(on, color)
-        if on_toggle:
-            t.toggled.connect(lambda checked: on_toggle(checked))
-        row.addWidget(t)
-        w._toggle = t
-        w._sub = sub_lbl
-        return w
-
     def _set_toggle_state(self, row, checked):
-        if not hasattr(row, "_toggle"):
-            return
-        t = row._toggle
-        try:
-            t.blockSignals(True)
-            t.setChecked(bool(checked))
-            t.blockSignals(False)
-        except RuntimeError:
-            pass
+        set_conn_toggle_state(row, checked)
 
     def _set_busy(self, row, busy):
-        if not hasattr(row, "_toggle"):
-            return
-        try:
-            row._toggle.setEnabled(not busy)
-        except RuntimeError:
-            pass
+        set_conn_row_busy(row, busy)
 
     def _run_toggle(self, row, action, fallback_label):
         if self._toggle_worker is not None:
@@ -450,14 +297,15 @@ class NetworkPage(QWidget):
         syncthing_service_active = bool((data or {}).get("syncthing_service_active", False))
         syncthing_api_reachable = bool((data or {}).get("syncthing_api_reachable", False))
         syncthing_reason = str((data or {}).get("syncthing_reason") or "unknown")
-        self._set_toggle_state(self._st_row, syncthing_service_active)
+        syncthing_effective_connected = bool(syncthing_api_reachable)
+        self._set_toggle_state(self._st_row, syncthing_effective_connected)
         self._st_row._sub.setText(
             (
                 "Service: active · API: reachable"
                 if syncthing_service_active and syncthing_api_reachable
                 else "Service: active · API: unreachable"
                 if syncthing_service_active
-                else "Service: inactive · API: reachable"
+                else "Service: inactive (external) · API: reachable"
                 if syncthing_api_reachable
                 else f"Service: inactive · API: unreachable ({syncthing_reason})"
             )
@@ -525,7 +373,7 @@ class NetworkPage(QWidget):
         target = bool(checked)
 
         def _action():
-            return connectivity.set_bluetooth(target, target=self.adb.target)
+            return connectivity.set_bluetooth(target, target=None)
 
         self._run_toggle(self._bt_row, _action, "Bluetooth toggle failed")
 
@@ -533,6 +381,6 @@ class NetworkPage(QWidget):
         target = bool(checked)
 
         def _action():
-            return connectivity.set_wifi(target, target=self.adb.target)
+            return connectivity.set_wifi(target, target=None)
 
         self._run_toggle(self._wifi_row, _action, "Wi-Fi toggle failed")

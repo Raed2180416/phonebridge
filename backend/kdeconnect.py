@@ -1,16 +1,17 @@
 """KDE Connect D-Bus interface — all plugins"""
+import difflib
 import logging
 import os
 import subprocess
-import configparser
-from pathlib import Path
 
 import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
-from backend.settings_store import get as setting
+from backend.settings_store import get as setting, set as set_setting
+from backend import kde_notifications
+from backend import kde_signals
+from backend import runtime_config
 
-DEVICE_ID = str(os.environ.get("PHONEBRIDGE_DEVICE_ID", "") or "").strip()
 BUS_NAME  = "org.kde.kdeconnect"
 log = logging.getLogger(__name__)
 
@@ -19,8 +20,11 @@ def get_bus():
 
 class KDEConnect:
     def __init__(self):
-        self.device_id = setting("device_id", DEVICE_ID)
+        self.device_id = runtime_config.device_id()
         self._bus = None
+        self._signal_receivers: list[tuple[object, object, dict]] = []
+        self.log = log
+        self._refresh_device_binding()
 
     @property
     def bus(self):
@@ -33,6 +37,91 @@ class KDEConnect:
 
     def _iface(self, path, iface):
         return dbus.Interface(self._obj(path), iface)
+
+    def _add_signal_receiver(self, callback, **kwargs):
+        match = self.bus.add_signal_receiver(callback, **kwargs)
+        self._signal_receivers.append((match, callback, dict(kwargs)))
+        return match
+
+    def disconnect_all_signals(self):
+        bus = self._bus
+        while self._signal_receivers:
+            match, callback, kwargs = self._signal_receivers.pop()
+            try:
+                if hasattr(match, "remove"):
+                    match.remove()
+                elif bus is not None and hasattr(bus, "remove_signal_receiver"):
+                    bus.remove_signal_receiver(callback, **kwargs)
+            except Exception:
+                log.debug("Failed removing KDE signal receiver kwargs=%s", kwargs, exc_info=True)
+
+    def _refresh_device_binding(self):
+        """Ensure self.device_id points to a currently valid KDE device.
+
+        Device IDs can drift after phone resets/re-pairs. If the configured
+        ID is stale, discover candidates from kdeconnectd and pick the best
+        match (prefer reachable+paired, then name similarity).
+        """
+        current = str(self.device_id or "").strip()
+        try:
+            daemon_obj = self.bus.get_object(BUS_NAME, "/modules/kdeconnect", introspect=False)
+            daemon = dbus.Interface(daemon_obj, "org.kde.kdeconnect.daemon")
+            reachable = [str(x) for x in (daemon.devices(True, True) or [])]
+            paired = [str(x) for x in (daemon.devices(False, True) or [])]
+            candidates = []
+            for did in reachable + paired:
+                if did not in candidates:
+                    candidates.append(did)
+            if not candidates:
+                return
+
+            # If current binding still exists, keep it.
+            if current and current in candidates:
+                return
+
+            desired_name = str(setting("device_name", "") or "").strip()
+            desired_norm = self._norm(desired_name)
+
+            chosen = candidates[0]
+            best_score = -1.0
+            for did in candidates:
+                name = self._device_name_for_id(did)
+                name_norm = self._norm(name)
+                score = 0.0
+                if did in reachable:
+                    score += 2.0
+                if desired_norm and name_norm:
+                    if desired_norm in name_norm or name_norm in desired_norm:
+                        score += 2.0
+                    score += difflib.SequenceMatcher(None, desired_norm, name_norm).ratio()
+                if score > best_score:
+                    best_score = score
+                    chosen = did
+
+            if chosen and chosen != current:
+                self.device_id = chosen
+                try:
+                    set_setting("device_id", chosen)
+                except Exception:
+                    pass
+                log.info("KDE device binding updated old=%s new=%s", current or "<unset>", chosen)
+        except Exception as exc:
+            log.debug("KDE device binding refresh skipped: %s", exc)
+
+    @staticmethod
+    def _norm(s: str) -> str:
+        return "".join(ch for ch in str(s or "").lower() if ch.isalnum())
+
+    def _device_name_for_id(self, device_id: str) -> str:
+        did = str(device_id or "").strip()
+        if not did:
+            return ""
+        try:
+            path = f"/modules/kdeconnect/devices/{did}"
+            props = dbus.Interface(self._obj(path), "org.freedesktop.DBus.Properties")
+            return str(props.Get("org.kde.kdeconnect.device", "name") or "")
+        except Exception:
+            return ""
 
     def _dev(self, plugin=None):
         p = f"/modules/kdeconnect/devices/{self.device_id}"
@@ -69,7 +158,8 @@ class KDEConnect:
                            "org.kde.kdeconnect.device.connectivity_report",
                            "cellularNetworkType")
             return str(t) if t else "Unknown"
-        except:
+        except Exception:
+            log.debug("Network type read failed", exc_info=True)
             return "Unknown"
 
     def get_signal_strength(self):
@@ -78,7 +168,8 @@ class KDEConnect:
                            "org.kde.kdeconnect.device.connectivity_report",
                            "cellularNetworkStrength")
             return int(s) if s is not None else -1
-        except:
+        except Exception:
+            log.debug("Signal strength read failed", exc_info=True)
             return -1
 
     # ── Find My Phone ──────────────────────────────────────────
@@ -101,115 +192,19 @@ class KDEConnect:
     #          notificationUpdated(s publicId)
     #          allNotificationsRemoved()
     def get_notifications(self):
-        try:
-            import time as _time
-            iface = self._iface(self._dev("notifications"),
-                                "org.kde.kdeconnect.device.notifications")
-            ids = iface.activeNotifications(timeout=3)
-            result = []
-            for nid in ids:
-                npath = self._dev(f"notifications/{nid}")
-                props = dbus.Interface(self._obj(npath),
-                                       "org.freedesktop.DBus.Properties")
-                ns = "org.kde.kdeconnect.device.notifications.notification"
-                try:
-                    def _get_prop(name, default=None):
-                        try:
-                            return props.Get(ns, name)
-                        except Exception:
-                            return default
-
-                    def _read_text():
-                        for key in ("text", "notitext", "ticker"):
-                            try:
-                                value = props.Get(ns, key)
-                                if value:
-                                    return str(value)
-                            except Exception:
-                                continue
-                        return ""
-
-                    result.append({
-                        "id":          str(nid),
-                        "app":         str(_get_prop("appName", "App")),
-                        "title":       str(_get_prop("title", "Notification")),
-                        "text":        _read_text(),
-                        "dismissable": bool(_get_prop("dismissable", True)),
-                        "replyId":     str(_get_prop("replyId", "") or ""),
-                        "actions":     list(_get_prop("actions", []) or []),
-                        "time_ms":     int(_time.time() * 1000),
-                    })
-                except Exception as e2:
-                    log.warning("Notification property read failed %s: %s", nid, e2)
-                    result.append({"id": str(nid), "app": "App", "title": "Notification",
-                                   "text": "", "dismissable": True,
-                                   "replyId": "", "actions": [],
-                                   "time_ms": int(_time.time() * 1000)})
-            return result
-        except Exception as e:
-            log.warning("Notifications fetch failed: %s", e)
-            return []
+        return kde_notifications.get_notifications(self)
 
     def dismiss_notification(self, notif_id):
-        """Dismiss via the per-notification object's dismiss() method"""
-        ok = False
-        try:
-            npath = self._dev(f"notifications/{notif_id}")
-            self._iface(npath,
-                        "org.kde.kdeconnect.device.notifications.notification"
-                        ).dismiss()
-            ok = True
-        except Exception as e:
-            log.warning("Notification dismiss failed %s: %s", notif_id, e)
-
-        # Some notifications respond only to sendAction() paths.
-        if not ok:
-            for candidate in ("dismiss", "clear", "default"):
-                try:
-                    self._iface(
-                        self._dev("notifications"),
-                        "org.kde.kdeconnect.device.notifications",
-                    ).sendAction(str(notif_id), candidate)
-                    ok = True
-                    break
-                except Exception:
-                    continue
-        return ok
+        return kde_notifications.dismiss_notification(self, notif_id)
 
     def open_notification_reply(self, notif_id):
-        """Trigger reply flow for a notification using per-notification reply()."""
-        try:
-            npath = self._dev(f"notifications/{notif_id}")
-            self._iface(
-                npath,
-                "org.kde.kdeconnect.device.notifications.notification",
-            ).reply()
-            return True
-        except Exception as e:
-            log.warning("Notification quick-reply open failed %s: %s", notif_id, e)
-            return False
+        return kde_notifications.open_notification_reply(self, notif_id)
 
     def reply_notification(self, reply_id, message):
-        """sendReply(s replyId, s message) on the notifications interface"""
-        try:
-            self._iface(self._dev("notifications"),
-                        "org.kde.kdeconnect.device.notifications"
-                        ).sendReply(reply_id, message)
-            return True
-        except Exception as e:
-            log.warning("Notification reply failed %s: %s", reply_id, e)
-            return False
+        return kde_notifications.reply_notification(self, reply_id, message)
 
     def send_notification_action(self, key, action):
-        """sendAction(s key, s action) on the notifications interface"""
-        try:
-            self._iface(self._dev("notifications"),
-                        "org.kde.kdeconnect.device.notifications"
-                        ).sendAction(key, action)
-            return True
-        except Exception as e:
-            log.warning("Notification action failed %s/%s: %s", key, action, e)
-            return False
+        return kde_notifications.send_notification_action(self, key, action)
 
     # ── SMS ────────────────────────────────────────────────────
     # Methods: sendSms(av addresses, s textMessage, av attachmentUrls)
@@ -342,7 +337,8 @@ class KDEConnect:
                            "org.kde.kdeconnect.device.clipboard",
                            "isAutoShareDisabled")
             return not bool(v)
-        except:
+        except Exception:
+            log.debug("Clipboard autoshare read failed", exc_info=True)
             return False
 
     # ── Run Commands ───────────────────────────────────────────
@@ -420,8 +416,8 @@ class KDEConnect:
                             phone = line.split(":")[-1].strip()
                     if name or phone:
                         contacts.append({"name": name, "phone": phone})
-                except:
-                    pass
+                except Exception:
+                    log.debug("Failed reading cached contact path=%s", path, exc_info=True)
         return contacts
 
     # ── SFTP ───────────────────────────────────────────────────
@@ -437,7 +433,8 @@ class KDEConnect:
     def get_sftp_path(self):
         try:
             return str(self._prop("sftp", "org.kde.kdeconnect.device.sftp", "mountPoint") or "")
-        except:
+        except Exception:
+            log.debug("SFTP mount path read failed", exc_info=True)
             return ""
 
     def get_receive_path(self):
@@ -474,130 +471,22 @@ class KDEConnect:
 
     @staticmethod
     def suppress_native_notification_popups(enable: bool = True) -> bool:
-        """
-        Disable KDE Connect's own desktop popup event so only PhoneBridge-mirrored
-        notifications are shown in the shell panel.
-        """
-        target_action = "None" if enable else "Popup"
-        cfg_path = Path.home() / ".config" / "knotifications6" / "kdeconnect.notifyrc"
-        cfg_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # KConfig is case-sensitive for key names in practice; keep exact casing.
-        desired = (
-            "[Event/notification]\n"
-            f"Action={target_action}\n"
-            "ShowInHistory=false\n"
-        )
-        current = ""
-        if cfg_path.exists():
-            try:
-                current = cfg_path.read_text(encoding="utf-8")
-            except Exception:
-                current = ""
-        if current.strip() == desired.strip():
-            return False
-        cfg_path.write_text(desired, encoding="utf-8")
-
-        # Best-effort daemon refresh; okay if unavailable.
-        try:
-            subprocess.run(
-                ["systemctl", "--user", "try-restart", "kdeconnectd.service"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=4,
-            )
-        except Exception:
-            pass
-        return True
+        return kde_notifications.suppress_native_notification_popups(enable)
 
     # ── Telephony signal listener ──────────────────────────────
     def connect_call_signal(self, callback):
-        """callback(event, number, contact_name)
-           event: 'ringing', 'talking', 'missed_call'
-        """
-        try:
-            self.bus.add_signal_receiver(
-                callback,
-                signal_name="callReceived",
-                dbus_interface="org.kde.kdeconnect.device.telephony",
-                bus_name=BUS_NAME,
-                path=self._dev("telephony"),
-            )
-            return True
-        except Exception as e:
-            log.warning("Call signal hook failed: %s", e)
-            return False
+        return kde_signals.connect_call_signal(self, callback)
 
     # ── Notification signal listeners ──────────────────────────
     def connect_notification_signal(self, posted_cb=None, removed_cb=None, updated_cb=None, all_removed_cb=None):
-        try:
-            if posted_cb:
-                self.bus.add_signal_receiver(
-                    posted_cb,
-                    signal_name="notificationPosted",
-                    dbus_interface="org.kde.kdeconnect.device.notifications",
-                    bus_name=BUS_NAME,
-                    path=self._dev("notifications"),
-                )
-            if removed_cb:
-                self.bus.add_signal_receiver(
-                    removed_cb,
-                    signal_name="notificationRemoved",
-                    dbus_interface="org.kde.kdeconnect.device.notifications",
-                    bus_name=BUS_NAME,
-                    path=self._dev("notifications"),
-                )
-            if updated_cb:
-                self.bus.add_signal_receiver(
-                    updated_cb,
-                    signal_name="notificationUpdated",
-                    dbus_interface="org.kde.kdeconnect.device.notifications",
-                    bus_name=BUS_NAME,
-                    path=self._dev("notifications"),
-                )
-            if all_removed_cb:
-                self.bus.add_signal_receiver(
-                    all_removed_cb,
-                    signal_name="allNotificationsRemoved",
-                    dbus_interface="org.kde.kdeconnect.device.notifications",
-                    bus_name=BUS_NAME,
-                    path=self._dev("notifications"),
-                )
-            return True
-        except Exception as e:
-            log.warning("Notification signal hook failed: %s", e)
-            return False
+        return kde_signals.connect_notification_signal(self, posted_cb, removed_cb, updated_cb, all_removed_cb)
 
     def connect_clipboard_signal(self, received_cb=None):
-        try:
-            if received_cb:
-                self.bus.add_signal_receiver(
-                    received_cb,
-                    signal_name="clipboardReceived",
-                    dbus_interface="org.kde.kdeconnect.device.clipboard",
-                    bus_name=BUS_NAME,
-                    path=self._dev("clipboard"),
-                )
-            return True
-        except Exception as e:
-            log.warning("Clipboard signal hook failed: %s", e)
-            return False
+        return kde_signals.connect_clipboard_signal(self, received_cb)
 
     # ── Battery signal ─────────────────────────────────────────
     def connect_battery_signal(self, callback):
-        try:
-            self.bus.add_signal_receiver(
-                callback,
-                signal_name="refreshed",
-                dbus_interface="org.kde.kdeconnect.device.battery",
-                bus_name=BUS_NAME,
-                path=self._dev("battery"),
-            )
-            return True
-        except Exception as e:
-            log.warning("Battery signal hook failed: %s", e)
-            return False
+        return kde_signals.connect_battery_signal(self, callback)
 
     # ── Device reachability ────────────────────────────────────
     def is_reachable(self) -> bool | None:
@@ -667,7 +556,7 @@ def kde_health_probe(device_id: str = "") -> dict:
     """
     import time as _time
 
-    _did = str(device_id or setting("device_id", DEVICE_ID) or "").strip()
+    _did = str(device_id or runtime_config.device_id() or "").strip()
     try:
         kc = KDEConnect()
         if _did:
@@ -711,4 +600,3 @@ def kde_health_probe(device_id: str = "") -> dict:
         "checked_at": int(_time.time() * 1000),
         "device_id": _did,
     }
-

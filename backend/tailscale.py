@@ -1,4 +1,5 @@
 """Tailscale status"""
+import difflib
 import json
 import re
 import subprocess
@@ -58,6 +59,14 @@ class Tailscale:
     def _find_phone_peer(self, peers: list[dict], phone_name: str = "", phone_ip: str = "") -> dict | None:
         expected_ip = str(phone_ip or "").strip()
         expected_name = self._norm(phone_name)
+
+        # If no explicit matcher is configured, pick the single non-self peer
+        # when unambiguous. This keeps mesh status sane on first-run setups.
+        if (not expected_ip) and (not expected_name):
+            non_self_online = [p for p in peers if not p.get("self") and p.get("online")]
+            if len(non_self_online) == 1:
+                return non_self_online[0]
+
         for peer in peers:
             peer_ips = peer.get("all_ips", []) or []
             if expected_ip and expected_ip in peer_ips:
@@ -67,6 +76,27 @@ class Tailscale:
                 peer_name = self._norm(peer.get("name", ""))
                 if peer_name and (expected_name in peer_name or peer_name in expected_name):
                     return peer
+
+            # Fuzzy fallback for cases where device names drift/typo, e.g.
+            # nothingphone3apro1 vs nothingphoen3apro1.
+            best_peer = None
+            best_ratio = 0.0
+            for peer in peers:
+                peer_name = self._norm(peer.get("name", ""))
+                if not peer_name:
+                    continue
+                ratio = difflib.SequenceMatcher(None, expected_name, peer_name).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_peer = peer
+            if best_peer is not None and best_ratio >= 0.70:
+                return best_peer
+
+            # If the user configured a phone name but there is only one
+            # non-self peer online, treat it as the phone candidate.
+            non_self_online = [p for p in peers if not p.get("self") and p.get("online")]
+            if len(non_self_online) == 1:
+                return non_self_online[0]
         return None
 
     def get_mesh_snapshot(self, *, phone_name: str = "", phone_ip: str = "") -> dict:
@@ -112,6 +142,8 @@ class Tailscale:
         phone_present = bool(phone_peer is not None)
         phone_online = bool(phone_peer and phone_peer.get("online"))
         mesh_ready = bool(local_connected and phone_online)
+        matched_phone_name = str((phone_peer or {}).get("name") or "")
+        matched_phone_ip = str((phone_peer or {}).get("ip") or "")
 
         if not local_connected:
             mesh_reason = f"local={backend_state or 'offline'}"
@@ -131,6 +163,8 @@ class Tailscale:
             "peers": peers,
             "phone_present": phone_present,
             "phone_online": phone_online,
+            "phone_name": matched_phone_name,
+            "phone_ip": matched_phone_ip,
             "mesh_ready": mesh_ready,
             "mesh_reason": mesh_reason,
         }

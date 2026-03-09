@@ -84,8 +84,8 @@ def _probe_adb() -> dict[str, Any]:
 def _probe_syncthing() -> dict[str, Any]:
     """Probe Syncthing REST API ping."""
     try:
-        from backend.syncthing import SyncthingClient
-        st = SyncthingClient()
+        from backend.syncthing import Syncthing
+        st = Syncthing()
         ok, http_status, detail = st.ping_status(timeout=4)
         if ok:
             return {
@@ -113,9 +113,9 @@ def _probe_syncthing() -> dict[str, Any]:
 def _probe_tailscale() -> dict[str, Any]:
     """Probe Tailscale daemon state."""
     try:
-        from backend.tailscale import TailscaleManager
-        ts = TailscaleManager()
-        status = ts.get_status()
+        from backend.tailscale import Tailscale
+        ts = Tailscale()
+        status = ts.get_status() or {}
         # get_status returns a dict with "backend_state" like "Running", "Stopped", etc.
         backend = str(status.get("backend_state", "") or status.get("BackendState", "") or "").lower()
         if backend == "running":

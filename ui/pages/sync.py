@@ -5,67 +5,16 @@ from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 from ui.theme import (card_frame, lbl, section_label, toggle_switch,
                       divider, TEAL, CYAN, BLUE, AMBER, ROSE,
                       TEXT, TEXT_DIM, BORDER)
+from backend import runtime_config
 from backend.syncthing import Syncthing
-
-
-_LAST_SYNC_STABILIZE_ATTEMPT = 0.0
+from backend.connectivity_snapshot import collect_sync_snapshot
 
 
 class SyncRefreshWorker(QThread):
     done = pyqtSignal(object)
 
     def run(self):
-        global _LAST_SYNC_STABILIZE_ATTEMPT
-        import time
-        st = Syncthing()
-        status = st.get_runtime_status(timeout=3)
-        service_active = bool(status.get("service_active", False))
-        api_reachable = bool(status.get("api_reachable", False))
-        reason = str(status.get("reason") or "unknown")
-        unit_file_state = str(status.get("unit_file_state") or "unknown")
-
-        if (not service_active) and unit_file_state != "masked" and reason in {
-            "unit_inactive_api_reachable",
-            "unit_inactive",
-            "unit_failed",
-            "service_inactive",
-        }:
-            now = time.time()
-            if (now - _LAST_SYNC_STABILIZE_ATTEMPT) > 30.0:
-                _LAST_SYNC_STABILIZE_ATTEMPT = now
-                st.set_running(True)
-                status = st.get_runtime_status(timeout=3)
-                service_active = bool(status.get("service_active", False))
-                api_reachable = bool(status.get("api_reachable", False))
-                reason = str(status.get("reason") or "unknown")
-                unit_file_state = str(status.get("unit_file_state") or "unknown")
-
-        effective_connected = bool(
-            (service_active and api_reachable)
-            or ((not service_active) and api_reachable)
-        )
-        if not effective_connected:
-            self.done.emit(
-                {
-                    "running": False,
-                    "service_active": service_active,
-                    "api_reachable": api_reachable,
-                    "unit_file_state": unit_file_state,
-                    "reason": reason,
-                    "folders": [],
-                    "rates": {},
-                }
-            )
-            return
-        self.done.emit({
-            "running": True,
-            "service_active": service_active,
-            "api_reachable": api_reachable,
-            "unit_file_state": unit_file_state,
-            "reason": reason,
-            "folders": st.get_folders(),
-            "rates": st.get_transfer_rates(),
-        })
+        self.done.emit(collect_sync_snapshot())
 
 
 def fmt_bytes(b):
@@ -185,7 +134,7 @@ class SyncPage(QWidget):
         info = QVBoxLayout()
         info.setSpacing(3)
         name_lbl = lbl(f["label"], 14, bold=True)
-        path_lbl = lbl(f["path"].replace("/home/raed","~"), 10, TEXT_DIM, mono=True)
+        path_lbl = lbl(runtime_config.shorten_home_path(f["path"]), 10, TEXT_DIM, mono=True)
         info.addWidget(name_lbl)
         info.addWidget(path_lbl)
         top.addLayout(info)

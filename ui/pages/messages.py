@@ -15,6 +15,11 @@ from backend.notification_mirror import (
     close_phone_notification,
     clear_phone_notifications,
 )
+from backend.notifications_state import (
+    normalize_notifications,
+    record_dismissed,
+    record_dismissed_many,
+)
 import logging
 
 log = logging.getLogger(__name__)
@@ -66,22 +71,45 @@ class _NotifFetchWorker(QObject):
             notifs = self._kc.get_notifications()
         except Exception:
             notifs = []
-        # Preserve existing time_ms from state for notifications we already know
-        existing: dict[str, dict] = {
-            str((r or {}).get("id") or ""): r
-            for r in (state.get("notifications") or [])
-            if (r or {}).get("id")
-        }
-        now_ms = int(time.time() * 1000)
-        for n in notifs:
-            nid = str(n.get("id") or "")
-            if not n.get("time_ms") and nid in existing and existing[nid].get("time_ms"):
-                n["time_ms"] = existing[nid]["time_ms"]
-            elif not n.get("time_ms"):
-                n["time_ms"] = now_ms
-        # Newest-first: higher time_ms first; stable secondary sort on id string
-        notifs.sort(key=lambda x: (-int(x.get("time_ms") or 0), str(x.get("id") or "")))
-        self.finished.emit(notifs)
+        self.finished.emit(normalize_notifications(notifs))
+
+
+class ContactsLoadWorker(QThread):
+    done = pyqtSignal(list, list)
+
+    def __init__(self, target: str = ""):
+        super().__init__()
+        self._target = str(target or "")
+
+    def run(self):
+        contacts = []
+        recent = []
+        try:
+            contacts = KDEConnect().get_cached_contacts() or []
+        except Exception:
+            contacts = []
+        try:
+            recent = ADBBridge(self._target).get_recent_calls(limit=80) or []
+        except Exception:
+            recent = []
+        self.done.emit(list(contacts), list(recent))
+
+
+class SmsSendWorker(QThread):
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, number: str, text: str):
+        super().__init__()
+        self._number = str(number or "")
+        self._text = str(text or "")
+
+    def run(self):
+        ok = False
+        try:
+            ok = bool(KDEConnect().send_sms(self._number, self._text))
+        except Exception:
+            ok = False
+        self.done.emit(ok, self._number)
 
 class SwipeNotifRow(QFrame):
     dismissed = pyqtSignal(str, object)
@@ -281,8 +309,13 @@ class MessagesPage(QWidget):
         self._notif_rows = []
         self._clear_all_in_progress = False
         self._fetch_thread: QThread | None = None
+        self._fetch_worker: _NotifFetchWorker | None = None
+        self._contacts_worker: ContactsLoadWorker | None = None
+        self._contacts_busy = False
+        self._sms_send_worker: SmsSendWorker | None = None
         self._build()
-        state.subscribe("notif_revision", self._on_notif_revision)
+        self.destroyed.connect(lambda *_args: self._poll_timer.stop())
+        state.subscribe("notif_revision", self._on_notif_revision, owner=self)
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._refresh_if_visible)
         self._poll_timer.start(2500)
@@ -420,6 +453,7 @@ class MessagesPage(QWidget):
             }}
         """)
         send_btn.clicked.connect(self._send_sms)
+        self._send_btn = send_btn
 
         sl.addWidget(self._sms_contact)
         sl.addWidget(self._sms_number)
@@ -442,9 +476,16 @@ class MessagesPage(QWidget):
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_notifs_fetched)
         worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_fetch_finished)
         self._fetch_thread = thread
+        self._fetch_worker = worker
         thread.start()
+
+    def _on_fetch_finished(self):
+        self._fetch_thread = None
+        self._fetch_worker = None
 
     def _on_notifs_fetched(self, notifs: list):
         if self._clear_all_in_progress:
@@ -534,6 +575,12 @@ class MessagesPage(QWidget):
         return row
 
     def _dismiss(self, notif_id, row_widget):
+        payload = None
+        for n in list(state.get("notifications", []) or []):
+            if str((n or {}).get("id") or "") == str(notif_id):
+                payload = dict(n or {})
+                break
+        record_dismissed(str(notif_id), payload)
         self.kc.dismiss_notification(notif_id)
         close_phone_notification(str(notif_id))
         row_widget.hide()
@@ -542,6 +589,12 @@ class MessagesPage(QWidget):
         QTimer.singleShot(140, self.refresh)
 
     def _on_swipe_dismissed(self, notif_id, row_widget):
+        payload = None
+        for n in list(state.get("notifications", []) or []):
+            if str((n or {}).get("id") or "") == str(notif_id):
+                payload = dict(n or {})
+                break
+        record_dismissed(str(notif_id), payload)
         self.kc.dismiss_notification(notif_id)
         close_phone_notification(str(notif_id))
         row_widget.hide()
@@ -594,8 +647,14 @@ class MessagesPage(QWidget):
     def _finalize_clear_all(self):
         self._clear_all_in_progress = False
         rows = self.kc.get_notifications()
+        ids = []
         for n in rows:
-            self.kc.dismiss_notification(n.get("id", ""))
+            nid = str(n.get("id", "") or "").strip()
+            if not nid:
+                continue
+            ids.append(nid)
+            self.kc.dismiss_notification(nid)
+        record_dismissed_many(ids)
         clear_phone_notifications()
         state.set("notif_revision", {"id": "all_removed", "updated_at": int(time.time() * 1000)})
         QTimer.singleShot(220, self.refresh)
@@ -606,21 +665,35 @@ class MessagesPage(QWidget):
         if not number or not text:
             self._sms_status.setText("Enter a phone number and message.")
             return
-        ok = self.kc.send_sms(number, text)
-        if ok:
-            self._sms_text.clear()
-            self._sms_status.setText("Message sent.")
-        else:
-            self._sms_status.setText("Failed to send. Check KDE Connect SMS permissions.")
-            log.warning("SMS send failed for %s", number)
+        if self._sms_send_worker is not None and self._sms_send_worker.isRunning():
+            self._sms_status.setText("SMS send already in progress.")
+            return
+        self._sms_status.setText("Sending…")
+        self._send_btn.setEnabled(False)
+        self._sms_send_worker = SmsSendWorker(number, text)
+        self._sms_send_worker.done.connect(self._on_sms_sent)
+        self._sms_send_worker.finished.connect(self._sms_send_worker.deleteLater)
+        self._sms_send_worker.start()
 
     def _load_contacts(self):
-        self._contacts = self.kc.get_cached_contacts()
-        recent = self.adb.get_recent_calls(limit=80)
+        if self._contacts_busy:
+            return
+        self._contacts_busy = True
+        self._sms_contact.clear()
+        self._sms_contact.addItem("Loading contacts…", "")
+        self._contacts_worker = ContactsLoadWorker()
+        self._contacts_worker.done.connect(self._apply_contacts_payload)
+        self._contacts_worker.finished.connect(self._on_contacts_worker_finished)
+        self._contacts_worker.finished.connect(self._contacts_worker.deleteLater)
+        self._contacts_worker.start()
+
+    def _apply_contacts_payload(self, contacts, recent):
+        self._contacts_busy = False
+        self._contacts = list(contacts or [])
         items = []
         seen = set()
 
-        for row in recent:
+        for row in list(recent or []):
             phone = (row.get("number") or "").strip()
             if not phone or phone in seen:
                 continue
@@ -645,6 +718,19 @@ class MessagesPage(QWidget):
             self._sms_contact.lineEdit().clear()
         phones = sorted({p for _, p in items if p})
         self._sms_number_completer.model().setStringList(phones)
+
+    def _on_contacts_worker_finished(self):
+        self._contacts_worker = None
+
+    def _on_sms_sent(self, ok: bool, number: str):
+        self._send_btn.setEnabled(True)
+        if ok:
+            self._sms_text.clear()
+            self._sms_status.setText("Message sent.")
+        else:
+            self._sms_status.setText("Failed to send. Check KDE Connect SMS permissions.")
+            log.warning("SMS send failed for %s", number)
+        self._sms_send_worker = None
 
     def _pick_contact(self):
         phone = self._sms_contact.currentData() or ""

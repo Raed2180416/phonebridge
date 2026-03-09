@@ -1,16 +1,15 @@
 """Settings page"""
-from pathlib import Path
 
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
-                              QLabel, QPushButton, QFrame, QLineEdit, QComboBox, QSlider)
+                              QLabel, QPushButton, QComboBox, QSlider)
 from PyQt6.QtCore import Qt, QTimer
 from ui.theme import (card_frame, lbl, section_label, action_btn, input_field,
-                      toggle_switch, divider, ToggleRow, InfoRow,
-                      TEAL, CYAN, VIOLET, ROSE, AMBER, TEXT, TEXT_DIM, BORDER)
+                      divider, ToggleRow, InfoRow,
+                      TEAL, CYAN, ROSE, TEXT, TEXT_DIM)
 import backend.settings_store as settings
 from backend import call_audio
 from backend import autostart
-from backend import system_integration
+from backend import runtime_config
 from backend.state import state
 from backend.ui_feedback import push_toast
 
@@ -20,7 +19,7 @@ class SettingsPage(QWidget):
         self.setStyleSheet("background:transparent;")
         self._build()
         # Refresh live volume readout when a call route becomes active/inactive
-        state.subscribe("call_audio_active", self._on_call_route_state_changed)
+        state.subscribe("call_audio_active", self._on_call_route_state_changed, owner=self)
 
     def _build(self):
         layout = QVBoxLayout(self)
@@ -34,13 +33,15 @@ class SettingsPage(QWidget):
         dl = QVBoxLayout(dev_frame)
         dl.setContentsMargins(0,8,0,8)
         dl.setSpacing(0)
-        dl.addWidget(InfoRow("📱","Device Name","",settings.get("device_name",""), clickable=False))
+        dl.addWidget(InfoRow("📱","Device Name","",runtime_config.device_name(), clickable=False))
         dl.addWidget(divider())
-        dl.addWidget(InfoRow("🌐","Phone Tailscale IP","",settings.get("phone_tailscale_ip",""),clickable=False))
+        dl.addWidget(InfoRow("🌐","Phone Tailscale IP","",runtime_config.phone_tailscale_ip(),clickable=False))
         dl.addWidget(divider())
-        dl.addWidget(InfoRow("🔗","NixOS Tailscale IP","",settings.get("nixos_tailscale_ip",""),clickable=False))
+        dl.addWidget(InfoRow("🔗","NixOS Tailscale IP","",runtime_config.host_tailscale_ip(),clickable=False))
         dl.addWidget(divider())
-        dl.addWidget(InfoRow("🔑","KDE Connect ID","",settings.get("device_id","")[:16]+"…",clickable=False))
+        device_id = runtime_config.device_id()
+        display_id = device_id[:16] + "…" if len(device_id) > 16 else device_id
+        dl.addWidget(InfoRow("🔑","KDE Connect ID","",display_id,clickable=False))
         layout.addWidget(dev_frame)
 
         # ── File paths ────────────────────────────────────────────
@@ -110,6 +111,16 @@ class SettingsPage(QWidget):
                               checked=settings.get("sync_on_mobile_data", False))
         sync_data.toggled.connect(self._set_sync_on_mobile_data)
         bl.addWidget(sync_data)
+        bl.addWidget(divider())
+
+        missed_calls = ToggleRow(
+            "📵",
+            "Missed Call Popups",
+            "Show a manual-dismiss popup when a call is missed",
+            checked=settings.get("missed_call_popups_enabled", True),
+        )
+        missed_calls.toggled.connect(lambda v: settings.set("missed_call_popups_enabled", bool(v)))
+        bl.addWidget(missed_calls)
         layout.addWidget(behav_frame)
 
         # ── Call Audio ───────────────────────────────────────────
@@ -118,7 +129,7 @@ class SettingsPage(QWidget):
         cal = QVBoxLayout(call_audio_frame)
         cal.setContentsMargins(20, 14, 20, 14)
         cal.setSpacing(10)
-        cal.addWidget(lbl("Changes apply live during laptop-routed calls. Outside active calls, values are saved for next call.", 10, TEXT_DIM))
+        cal.addWidget(lbl("Settings are saved immediately but only applied to system audio during active laptop-routed calls. After the call ends, audio reverts to pre-call levels.", 10, TEXT_DIM))
 
         output_row = QHBoxLayout()
         output_row.addWidget(lbl("Output Device", 12, bold=True))
@@ -201,104 +212,12 @@ class SettingsPage(QWidget):
         startup.toggled.connect(self._set_start_on_login)
         sl.addWidget(startup)
         sl.addWidget(divider())
-        startup_check = ToggleRow("🔔","Startup Connectivity Check",
-                                   "Show popout on login",
-                                   checked=settings.get("startup_check_on_login", True))
-        startup_check.toggled.connect(
-            lambda v: settings.set("startup_check_on_login", bool(v))
-        )
-        sl.addWidget(startup_check)
-        sl.addWidget(divider())
         close_mode = ToggleRow("🗕","Close to Tray",
                                "When window is closed, minimize to tray instead of quitting",
                                checked=settings.get("close_to_tray", True))
         close_mode.toggled.connect(lambda v: settings.set("close_to_tray", v))
         sl.addWidget(close_mode)
-        sl.addWidget(divider())
-        sl.addWidget(InfoRow("⌨️","Toggle Keybind","Show/hide window",
-                              "Super + P",clickable=False))
         layout.addWidget(sys_frame)
-
-        # ── Integration Writes (Opt-in) ────────────────────────
-        layout.addWidget(section_label("Integration Writes (Opt-in)"))
-        integ_frame = card_frame()
-        il = QVBoxLayout(integ_frame)
-        il.setContentsMargins(0,8,0,8)
-        il.setSpacing(0)
-
-        icon_row = ToggleRow(
-            "🎨",
-            "Manage App Icon",
-            "Allow startup to create/update ~/.local/share/icons/.../phonebridge.svg",
-            checked=settings.get("integration_manage_icon", False),
-        )
-        self._integration_icon_row = icon_row
-        icon_row.toggled.connect(self._set_manage_icon)
-        il.addWidget(icon_row)
-        il.addWidget(divider())
-
-        desktop_row = ToggleRow(
-            "🧩",
-            "Manage Desktop Entry",
-            "Allow startup to create/update ~/.local/share/applications/phonebridge.desktop",
-            checked=settings.get("integration_manage_desktop_entry", False),
-        )
-        self._integration_desktop_row = desktop_row
-        desktop_row.toggled.connect(self._set_manage_desktop_entry)
-        il.addWidget(desktop_row)
-        il.addWidget(divider())
-
-        hypr_row = ToggleRow(
-            "⌨️",
-            "Manage Hyprland SUPER+P Bind",
-            "Allow startup to manage ~/.config/hypr/phonebridge.conf only",
-            checked=settings.get("integration_manage_hypr_bind", False),
-        )
-        self._integration_hypr_row = hypr_row
-        hypr_row.toggled.connect(self._set_manage_hypr_bind)
-        il.addWidget(hypr_row)
-        il.addWidget(divider())
-
-        auto_start_row = ToggleRow(
-            "🛠️",
-            "Auto-Enable Start on Login",
-            "Allow startup to auto-enable the PhoneBridge user service",
-            checked=settings.get("integration_manage_autostart", False),
-        )
-        self._integration_autostart_row = auto_start_row
-        auto_start_row.toggled.connect(self._set_manage_autostart)
-        il.addWidget(auto_start_row)
-        layout.addWidget(integ_frame)
-
-        # ── Appearance ───────────────────────────────────────────
-        layout.addWidget(section_label("Appearance"))
-        app_frame = card_frame()
-        apl = QVBoxLayout(app_frame)
-        apl.setContentsMargins(20,14,20,14)
-        apl.setSpacing(10)
-
-        theme_row = QHBoxLayout()
-        theme_row.addWidget(lbl("Theme", 12, bold=True))
-        theme_row.addStretch()
-        self._theme_combo = QComboBox()
-        self._theme_combo.setStyleSheet(f"""
-            QComboBox {{
-                background:rgba(255,255,255,0.05);
-                border:1px solid rgba(255,255,255,0.12);
-                border-radius:8px;color:{TEXT};padding:6px 10px;font-size:11px;
-            }}
-        """)
-        self._theme_combo.addItem("Slate", "slate")
-        self._theme_combo.addItem("Mist", "mist")
-        self._theme_combo.addItem("Night", "night")
-        current_theme = str(settings.get("theme_name", "slate") or "slate")
-        idx = max(0, self._theme_combo.findData(current_theme))
-        self._theme_combo.setCurrentIndex(idx)
-        self._theme_combo.currentIndexChanged.connect(self._set_theme)
-        theme_row.addWidget(self._theme_combo)
-        apl.addLayout(theme_row)
-        apl.addWidget(lbl("Theme updates colors and accents across the app.", 10, TEXT_DIM))
-        layout.addWidget(app_frame)
 
         # ── About ────────────────────────────────────────────────
         layout.addWidget(section_label("About"))
@@ -331,13 +250,6 @@ class SettingsPage(QWidget):
         layout.addWidget(about_frame)
         layout.addStretch()
 
-    def _set_theme(self):
-        theme = self._theme_combo.currentData() or "slate"
-        settings.set("theme_name", theme)
-        win = self.window()
-        if win and hasattr(win, "apply_visual_settings"):
-            win.apply_visual_settings(theme_name=theme)
-
     def _set_start_on_login(self, enabled):
         target = bool(enabled)
         ok, msg = autostart.set_enabled(target)
@@ -356,59 +268,10 @@ class SettingsPage(QWidget):
             1700,
         )
 
-    @staticmethod
-    def _project_root() -> str:
-        return str(Path(__file__).resolve().parents[2])
-
-    def _set_manage_icon(self, enabled):
-        ok, msg = system_integration.set_icon_management(bool(enabled))
-        actual = bool(settings.get("integration_manage_icon", False))
-        self._sync_integration_toggle("_integration_icon_row", actual)
-        if not ok or actual != bool(enabled):
-            push_toast(msg or "Could not update icon management", "warning", 2800)
-            return
-        push_toast("Icon management enabled" if actual else "Icon management disabled", "success" if actual else "info", 1700)
-
-    def _set_manage_desktop_entry(self, enabled):
-        ok, msg = system_integration.set_desktop_entry_management(self._project_root(), bool(enabled))
-        actual = bool(settings.get("integration_manage_desktop_entry", False))
-        self._sync_integration_toggle("_integration_desktop_row", actual)
-        if not ok or actual != bool(enabled):
-            push_toast(msg or "Could not update desktop entry management", "warning", 2800)
-            return
-        push_toast("Desktop entry management enabled" if actual else "Desktop entry management disabled", "success" if actual else "info", 1700)
-
-    def _set_manage_hypr_bind(self, enabled):
-        ok, msg = system_integration.set_hyprland_binding_management(self._project_root(), bool(enabled))
-        actual = bool(settings.get("integration_manage_hypr_bind", False))
-        self._sync_integration_toggle("_integration_hypr_row", actual)
-        if not ok or actual != bool(enabled):
-            push_toast(msg or "Could not update Hyprland binding management", "warning", 2800)
-            return
-        push_toast("Hyprland bind management enabled" if actual else "Hyprland bind management disabled", "success" if actual else "info", 1700)
-
-    def _set_manage_autostart(self, enabled):
-        ok, msg = system_integration.set_autostart_management(bool(enabled))
-        actual = bool(settings.get("integration_manage_autostart", False))
-        self._sync_integration_toggle("_integration_autostart_row", actual)
-        if not ok or actual != bool(enabled):
-            push_toast(msg or "Could not update autostart auto-management", "warning", 2800)
-            return
-        push_toast("Autostart auto-management enabled" if actual else "Autostart auto-management disabled", "success" if actual else "info", 1700)
-
     def _sync_startup_toggle(self, enabled):
         if not hasattr(self, "_startup_row"):
             return
         toggle = self._startup_row.toggle
-        toggle.blockSignals(True)
-        toggle.setChecked(bool(enabled))
-        toggle.blockSignals(False)
-
-    def _sync_integration_toggle(self, row_attr, enabled):
-        row = getattr(self, row_attr, None)
-        if not row:
-            return
-        toggle = row.toggle
         toggle.blockSignals(True)
         toggle.setChecked(bool(enabled))
         toggle.blockSignals(False)
@@ -541,6 +404,7 @@ class SettingsPage(QWidget):
 
     def _on_call_output_volume_changed(self, value):
         self._call_output_vol_value.setText(f"{int(value)}%")
+        settings.set("call_output_volume_pct", int(value))
         if self._call_route_active():
             call_audio.set_output_volume_pct(int(value), persist=False)
 
@@ -551,6 +415,7 @@ class SettingsPage(QWidget):
 
     def _on_call_input_volume_changed(self, value):
         self._call_input_vol_value.setText(f"{int(value)}%")
+        settings.set("call_input_volume_pct", int(value))
         if self._call_route_active():
             call_audio.set_input_volume_pct(int(value), persist=False)
 

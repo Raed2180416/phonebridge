@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """PhoneBridge — entry point."""
-import sys, os, argparse, socket
+import sys, os, argparse, socket, json
 import importlib
 import logging
 import shutil
@@ -199,15 +199,30 @@ def main():
         if wait_and_send_ipc(command, timeout_ms=5000, step_ms=100):
             print(f"PhoneBridge singleton: forwarded IPC command={command!r}", file=sys.stderr)
             return
-        print(
-            f"PhoneBridge singleton: lock denied and IPC forward timed out command={command!r}; "
-            "request dropped to preserve singleton behavior.",
-            file=sys.stderr,
-        )
-        return
+        # Recovery path: owner may have died between lock check and IPC server
+        # availability, or may be wedged during startup. Retry lock acquisition
+        # briefly before dropping the request.
+        retry_deadline = time.monotonic() + 3.0
+        while time.monotonic() < retry_deadline:
+            time.sleep(0.15)
+            lock_fd, is_owner = _acquire_singleton_lock()
+            if is_owner:
+                break
+            if wait_and_send_ipc(command, timeout_ms=250, step_ms=50):
+                print(f"PhoneBridge singleton: forwarded IPC command={command!r} (late)", file=sys.stderr)
+                return
+        if is_owner:
+            print("PhoneBridge singleton: recovered stale lock owner; launching new instance", file=sys.stderr)
+        else:
+            print(
+                f"PhoneBridge singleton: lock denied and IPC forward timed out command={command!r}; "
+                "request dropped to preserve singleton behavior.",
+                file=sys.stderr,
+            )
+            return
 
     from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
-    from PyQt6.QtGui import QIcon
+    from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen
     from PyQt6.QtCore import QTimer, QSocketNotifier
     import dbus.mainloop.glib
     from backend.logger import setup_logging
@@ -223,13 +238,72 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("PhoneBridge")
+    # Ensure compositor/taskbar maps this process to phonebridge.desktop even
+    # when launched from scripts (e.g. toggle keybind) instead of app launcher.
+    try:
+        app.setDesktopFileName("phonebridge")
+    except Exception:
+        pass
     app.setQuitOnLastWindowClosed(False)
+
+    def _icon_has_pixels(icon: QIcon) -> bool:
+        if icon.isNull():
+            return False
+        try:
+            return not icon.pixmap(24, 24).isNull()
+        except Exception:
+            return False
+
+    def _build_fallback_icon() -> QIcon:
+        # Programmatic icon that does not depend on SVG/icon theme plugins.
+        size = 64
+        pm = QPixmap(size, size)
+        pm.fill(QColor(0, 0, 0, 0))
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        # Device body
+        p.setPen(QPen(QColor("#0f172a"), 2))
+        p.setBrush(QColor("#111827"))
+        p.drawRoundedRect(10, 4, 44, 56, 10, 10)
+
+        # Screen
+        p.setPen(QPen(QColor("#94a3b8"), 1))
+        p.setBrush(QColor("#1f2937"))
+        p.drawRoundedRect(16, 11, 32, 40, 5, 5)
+
+        # Home dot
+        p.setPen(QPen(QColor("#e2e8f0"), 1))
+        p.setBrush(QColor("#e2e8f0"))
+        p.drawEllipse(30, 53, 4, 4)
+        p.end()
+        return QIcon(pm)
+
     icon_path = os.path.expanduser("~/.local/share/icons/hicolor/scalable/apps/phonebridge.svg")
+    # Build a single QIcon to share across app, window, and tray so they
+    # always render identically (fromTheme is unreliable inside bwrap).
     if os.path.exists(icon_path):
-        app.setWindowIcon(QIcon(icon_path))
+        app_icon = QIcon(icon_path)
+    else:
+        app_icon = QIcon.fromTheme("phonebridge")
+    if not _icon_has_pixels(app_icon):
+        app_icon = QIcon.fromTheme("phonebridge")
+    if not _icon_has_pixels(app_icon):
+        app_icon = QIcon.fromTheme("smartphone")
+    if not _icon_has_pixels(app_icon):
+        app_icon = QIcon.fromTheme("phone")
+    if not _icon_has_pixels(app_icon):
+        app_icon = _build_fallback_icon()
+    if _icon_has_pixels(app_icon):
+        app.setWindowIcon(app_icon)
 
     from ui.window import PhoneBridgeWindow
     window = PhoneBridgeWindow()
+    if not app_icon.isNull():
+        try:
+            window.setWindowIcon(app_icon)
+        except Exception:
+            pass
 
     # ── IPC socket for --toggle ──────────────────────────────
     sock_path = _socket_path()
@@ -297,20 +371,144 @@ def main():
 
     notifier = QSocketNotifier(server.fileno(), QSocketNotifier.Type.Read)
 
+    def _files_page():
+        window.show_and_raise(reason="ipc:files_page")
+        window.go_to("files")
+        return window.get_page("files")
+
+    def _dispatch_ipc_json(payload: dict) -> None:
+        cmd = str((payload or {}).get("cmd") or "").strip().lower()
+        if cmd == "goto":
+            page = str((payload or {}).get("page") or "").strip()
+            if page:
+                log.info("IPC: goto page=%s", page)
+                window.show_and_raise(reason=f"ipc_json:goto:{page}")
+                window.go_to(page)
+            return
+        if cmd == "files_refresh":
+            page = _files_page()
+            if page and hasattr(page, "refresh"):
+                log.info("IPC: files_refresh")
+                page.refresh()
+            return
+        if cmd == "files_open":
+            folder_id = str((payload or {}).get("folder_id") or "").strip()
+            page = _files_page()
+            ok = bool(page and hasattr(page, "open_folder_by_id") and page.open_folder_by_id(folder_id))
+            log.info("IPC: files_open folder_id=%s ok=%s", folder_id, ok)
+            return
+        if cmd == "files_add_custom":
+            folder_id = str((payload or {}).get("folder_id") or "").strip()
+            name = str((payload or {}).get("name") or "").strip()
+            path = str((payload or {}).get("path") or "").strip()
+            page = _files_page()
+            ok = bool(
+                page
+                and hasattr(page, "add_custom_folder_for_test")
+                and page.add_custom_folder_for_test(folder_id, name, path)
+            )
+            log.info("IPC: files_add_custom folder_id=%s ok=%s path=%s", folder_id, ok, path)
+            return
+        if cmd == "files_remove_custom":
+            folder_id = str((payload or {}).get("folder_id") or "").strip()
+            page = _files_page()
+            ok = bool(
+                page
+                and hasattr(page, "remove_custom_folder_for_test")
+                and page.remove_custom_folder_for_test(folder_id)
+            )
+            log.info("IPC: files_remove_custom folder_id=%s ok=%s", folder_id, ok)
+            return
+        if cmd == "files_mkdir":
+            folder_id = str((payload or {}).get("folder_id") or "").strip()
+            name = str((payload or {}).get("name") or "").strip()
+            page = _files_page()
+            ok = bool(
+                page
+                and hasattr(page, "create_subfolder_for_test")
+                and page.create_subfolder_for_test(folder_id, name)
+            )
+            log.info("IPC: files_mkdir folder_id=%s name=%s ok=%s", folder_id, name, ok)
+            return
+        if cmd == "test_call_event":
+            event = str((payload or {}).get("event") or "").strip() or "ringing"
+            number = str((payload or {}).get("number") or "").strip()
+            name = str((payload or {}).get("name") or number or "Test Call").strip()
+            log.info("IPC: test_call_event event=%s number=%s name=%s", event, number, name)
+            normalized = event.strip().lower()
+            if normalized in {"ringing", "incoming", "incoming_call", "talking", "active", "answered"}:
+                window._suspend_poll_until = time.time() + 10.0
+            elif normalized in {"ended", "end", "missed", "missed_call", "rejected", "declined"}:
+                window._suspend_poll_until = time.time() + 1.0
+            window._on_call_received(event, number, name)
+            return
+        log.warning("IPC: unsupported json command=%s", cmd)
+
+    def _dispatch_ipc_message(msg: bytes) -> None:
+        if not msg:
+            return
+        text = msg.decode("utf-8", "replace").strip()
+        if not text:
+            return
+        if text.startswith("{"):
+            try:
+                payload = json.loads(text)
+            except Exception:
+                log.exception("IPC: invalid JSON payload")
+            else:
+                if isinstance(payload, dict):
+                    _dispatch_ipc_json(payload)
+                else:
+                    log.warning("IPC: JSON payload must be an object")
+            return
+        if msg == b"toggle":
+            if window.isVisible() and window.isActiveWindow():
+                window.hide()
+            else:
+                window.show_and_raise(reason="ipc:toggle")
+            return
+        if msg == b"quit":
+            log.info("IPC: quit request received")
+            app.quit()
+            return
+        if msg == b"show":
+            window.show_and_raise(reason="ipc:show")
+            return
+        if text.startswith("goto:"):
+            page = text.split(":", 1)[1].strip()
+            if page:
+                log.info("IPC: goto page=%s", page)
+                window.show_and_raise(reason=f"ipc:goto:{page}")
+                window.go_to(page)
+            return
+        if msg == b"test_call":
+            log.info("IPC: test_call trigger received")
+            popup = window._ensure_call_popup()
+            log.info("IPC: deferring handle_call_event 150ms")
+            from PyQt6.QtCore import QTimer as _QT
+            window._suspend_poll_until = time.time() + 300
+            def _deferred_call():
+                popup.handle_call_event("+0000000000", "Test Call", "ringing")
+                popup._stop_state_watcher()
+                log.info("IPC: test_call popup active (poll+watcher suppressed)")
+            _QT.singleShot(150, _deferred_call)
+            return
+        if msg == b"test_missed":
+            log.info("IPC: test_missed trigger received")
+            popup = window._ensure_call_popup()
+            popup.handle_call_event("+0000000000", "Test Missed", "missed_call")
+            log.info("IPC: test_missed popup shown")
+            return
+        if msg == b"noop":
+            return
+        log.warning("IPC: unsupported raw command=%r", msg)
+
     def on_toggle():
         try:
             conn, _ = server.accept()
-            msg = conn.recv(16)
+            msg = conn.recv(4096).strip()
             conn.close()
-            if msg == b"toggle":
-                if window.isVisible() and window.isActiveWindow():
-                    window.hide()
-                else:
-                    window.show_and_raise()
-            elif msg == b"show":
-                window.show_and_raise()
-            elif msg == b"noop":
-                pass
+            _dispatch_ipc_message(msg)
         except Exception:
             log.exception("Failed to process toggle IPC message")
 
@@ -324,16 +522,9 @@ def main():
     tray_retry_timer.setSingleShot(False)
 
     def _resolve_tray_icon() -> QIcon:
-        tray_icon = QIcon.fromTheme("phonebridge")
-        if tray_icon.isNull() and os.path.exists(icon_path):
-            tray_icon = QIcon(icon_path)
-        if tray_icon.isNull():
-            tray_icon = QIcon.fromTheme("smartphone")
-        if tray_icon.isNull():
-            tray_icon = QIcon.fromTheme("phone")
-        if tray_icon.isNull():
-            tray_icon = app.style().standardIcon(app.style().StandardPixmap.SP_DesktopIcon)
-        return tray_icon
+        if not app_icon.isNull():
+            return app_icon
+        return app.style().standardIcon(app.style().StandardPixmap.SP_DesktopIcon)
 
     def _install_tray() -> bool:
         nonlocal tray
@@ -354,7 +545,7 @@ def main():
             window.run_startup_check(
                 from_tray=True,
                 anchor_pos=QCursor.pos(),
-                close_on_mouse_leave=True,
+                close_on_mouse_leave=False,
             )
 
         check_action.triggered.connect(_open_connectivity_from_tray)
@@ -388,7 +579,7 @@ def main():
         menu.addAction("Quit", window.quit_app)
         tray.setContextMenu(menu)
         tray.activated.connect(
-            lambda r: window.show_and_raise()
+            lambda r: window.show_and_raise(reason="tray:click")
             if r == QSystemTrayIcon.ActivationReason.Trigger else None
         )
         tray.show()
@@ -409,10 +600,8 @@ def main():
 
     # ── Startup ──────────────────────────────────────────────
     import backend.settings_store as settings
-    if args.background and bool(settings.get("startup_check_on_login", True)):
-        QTimer.singleShot(1200, lambda: window.run_startup_check(background_mode=True))
     if not args.background:
-        window.show_and_raise()
+        window.show_and_raise(reason="startup:foreground")
 
     sys.exit(app.exec())
 

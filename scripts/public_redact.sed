@@ -1,0 +1,10 @@
+s#(X-API-Key:[[:space:]]*)[^[:space:]]+#\1<API_KEY_REDACTED>#gi
+s#("syncthing_api_key"[[:space:]]*:[[:space:]]*")[^"]+("[[:space:]]*)#\1<API_KEY_REDACTED>\2#g
+s#\b[A-Za-z0-9+/=_-]{24,}\b#<TOKEN_REDACTED>#g
+s#/home/[A-Za-z0-9._-]+#/home/<USER>#g
+s#(/etc/profiles/per-user/)[^/]+#\1<USER>#g
+s#nodekey:[A-Za-z0-9]+#nodekey:<REDACTED>#g
+s#\b([0-9]{1,3}\.){3}[0-9]{1,3}\b#<IP_REDACTED>#g
+s#\b[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}\b#<MAC_REDACTED>#g
+s#\b[0-9a-fA-F]{32}\b#<HEX32_REDACTED>#g
+s#\b([A-Za-z0-9._-]{1,64})@([A-Za-z0-9._-]{1,64})\b#<USER>@<HOST>#g

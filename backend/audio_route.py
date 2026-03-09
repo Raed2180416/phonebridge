@@ -137,7 +137,7 @@ def _bt_media_route_active() -> bool:
             ["pactl", "list", "short", "sinks"],
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=0.5,
         )
         if r.returncode == 0:
             out = (r.stdout or "").lower()
@@ -150,7 +150,7 @@ def _bt_media_route_active() -> bool:
             ["pactl", "list", "short", "sink-inputs"],
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=0.5,
         )
         if r.returncode == 0:
             out = (r.stdout or "").lower()
@@ -163,7 +163,7 @@ def _bt_media_route_active() -> bool:
             ["wpctl", "status"],
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=0.5,
         )
         if r.returncode == 0:
             for raw in (r.stdout or "").splitlines():
@@ -182,7 +182,7 @@ def _bt_call_profile_present() -> bool:
             ["wpctl", "status"],
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=0.5,
         )
         if r.returncode != 0:
             return False
@@ -203,7 +203,7 @@ def _bt_call_profile_present() -> bool:
                 ["wpctl", "inspect", dev_id],
                 capture_output=True,
                 text=True,
-                timeout=2,
+                timeout=0.5,
             )
             if ri.returncode != 0:
                 continue
@@ -225,18 +225,70 @@ def _bt_call_profile_present() -> bool:
                 profile_active = True
                 break
     except Exception:
-        return False
-    return profile_active
+        profile_active = False
+    if profile_active:
+        return True
+    try:
+        r = subprocess.run(
+            ["pactl", "list", "cards"],
+            capture_output=True,
+            text=True,
+            timeout=0.7,
+        )
+        if r.returncode == 0:
+            low = (r.stdout or "").lower()
+            if "bluez_card." in low and any(
+                token in low
+                for token in (
+                    "active profile: audio-gateway",
+                    "active profile: headset-head-unit",
+                    "active profile: handsfree_head_unit",
+                    "active profile: hfp_hf",
+                    "active profile: hsp_hs",
+                    "audio-gateway",
+                    "handsfree",
+                    "headset",
+                    "hfp",
+                    "hsp",
+                )
+            ):
+                return True
+    except Exception:
+        log.debug("pactl card fallback failed while probing BT call profile", exc_info=True)
+    return False
 
 
 def _bt_call_mic_path_active() -> bool:
+    def _wpctl_sources_has_bt_call_source(status_text: str) -> bool:
+        in_sources = False
+        for raw in (status_text or "").splitlines():
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            header = stripped.strip("│├└─* ").lower()
+            if header == "sources:":
+                in_sources = True
+                continue
+            if header.endswith(":") and header != "sources:":
+                in_sources = False
+                continue
+            if not in_sources:
+                continue
+            line = stripped.lower()
+            if any(
+                token in line
+                for token in ("bluez_input.", "handsfree", "headset", "hfp", "hsp", "audio-gateway", "audio_gateway")
+            ):
+                return True
+        return False
+
     # Call mode requires a Bluetooth input node (laptop mic path).
     try:
         r = subprocess.run(
             ["pactl", "list", "short", "sources"],
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=0.5,
         )
         if r.returncode == 0:
             out = (r.stdout or "").lower()
@@ -249,7 +301,7 @@ def _bt_call_mic_path_active() -> bool:
             ["pactl", "list", "sources"],
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=0.5,
         )
         if r.returncode == 0:
             out = (r.stdout or "").lower()
@@ -262,13 +314,10 @@ def _bt_call_mic_path_active() -> bool:
             ["wpctl", "status"],
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=0.5,
         )
         if r.returncode == 0:
-            for raw in (r.stdout or "").splitlines():
-                line = raw.strip().lower()
-                if not any(k in line for k in ("bluez_input.", "[bluez5]", "handsfree", "headset")):
-                    continue
+            if _wpctl_sources_has_bt_call_source(r.stdout or ""):
                 return True
     except Exception:
         pass
@@ -287,7 +336,7 @@ def _boost_call_mic_gain() -> None:
             ["pactl", "list", "short", "sources"],
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=0.5,
         )
         if r.returncode == 0:
             for raw in (r.stdout or "").splitlines():
@@ -304,7 +353,7 @@ def _boost_call_mic_gain() -> None:
                     ["pactl", "set-source-volume", src, "140%"],
                     capture_output=True,
                     text=True,
-                    timeout=2,
+                    timeout=0.5,
                 )
                 return
     except Exception:
@@ -314,7 +363,7 @@ def _boost_call_mic_gain() -> None:
             ["wpctl", "set-volume", "@DEFAULT_AUDIO_SOURCE@", "1.40"],
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=0.5,
         )
     except Exception:
         pass
@@ -557,6 +606,22 @@ def _wait_for_bt_call_mic_path(call_retry_ms: int, retry_step_ms: int) -> bool:
 
 
 def _call_route_active_result(reason: str = "Bluetooth call mic path is active") -> RouteSyncResult:
+    # Guard: if call_pc_active was cleared while sync_result() was running on a
+    # background/QThread, do NOT write pc_active state.  Without this, the
+    # background thread's state.set() calls race against set_route_phone()'s
+    # corrections and can overwrite _data after the main thread already fixed it,
+    # causing the tile UI to revert to "laptop active" even though phone was
+    # selected.
+    if not bool(_sources.get("call_pc_active", False)):
+        log.debug("_call_route_active_result: call_pc_active cancelled – discarding stale result")
+        _stop_call_route_watchdog()
+        return RouteSyncResult(
+            ok=False,
+            status="cancelled",
+            mode="audio",
+            backend="none",
+            reason="Route request was cancelled",
+        )
     try:
         from backend import call_audio
 
@@ -657,14 +722,16 @@ def sync_result(
                 return _call_route_failed_result("Bluetooth call mic path not detected in time")
             return _call_route_pending_result()
 
-        if not _bt_call_profile_present():
-            return _call_route_failed_result("Bluetooth call profile unavailable")
-
+        # Some devices expose the BT call mic path even when profile probes are
+        # flaky. Prefer observed mic-path readiness over profile heuristics.
         if _wait_for_bt_call_mic_path(call_retry_ms, retry_step_ms):
             started = _start_proc("audio", adb=adb)
             if started and _bt_call_mic_path_active():
                 return _call_route_active_result()
             return _call_route_pending_result()
+
+        if not _bt_call_profile_present():
+            return _call_route_failed_result("Bluetooth call profile unavailable")
 
         if int(call_retry_ms or 0) > 0:
             return _call_route_failed_result("Bluetooth call mic path not detected in time")

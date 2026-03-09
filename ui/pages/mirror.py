@@ -56,7 +56,7 @@ class MirrorPage(QWidget):
         self._build()
 
         from backend.state import state
-        state.subscribe("audio_redirect_enabled", self._on_audio_redirect_state_changed)
+        state.subscribe("audio_redirect_enabled", self._on_audio_redirect_state_changed, owner=self)
 
         self._proc_timer = QTimer(self)
         self._proc_timer.timeout.connect(self._sync_process_state)

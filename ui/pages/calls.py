@@ -1,9 +1,11 @@
 """Calls page — place calls, contacts, call history"""
+import logging
+import threading
+
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                               QLabel, QPushButton, QFrame,
                               QGridLayout)
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
-import subprocess
 from ui.theme import (card_frame, lbl, section_label, action_btn, input_field,
                       divider, TEAL, CYAN, VIOLET, ROSE, AMBER, TEXT,
                       TEXT_DIM, TEXT_MID, BORDER)
@@ -11,9 +13,13 @@ from backend.kdeconnect import KDEConnect
 from backend.adb_bridge import ADBBridge
 from backend.ui_feedback import push_toast
 from backend import audio_route
+from backend import call_controls
+from backend.call_routing import outbound_origin_active, seed_outbound_call_session
 import backend.settings_store as settings
 from backend.state import state
 import time
+
+log = logging.getLogger(__name__)
 
 
 class CallsHistoryWorker(QThread):
@@ -25,7 +31,7 @@ class CallsHistoryWorker(QThread):
         self._limit = limit
 
     def run(self):
-        rows = ADBBridge(self._target).get_recent_calls(limit=self._limit)
+        rows = ADBBridge(self._target or None).get_recent_calls(limit=self._limit)
         self.done.emit(rows or [])
 
 
@@ -38,7 +44,7 @@ class ContactsWorker(QThread):
         self._limit = limit
 
     def run(self):
-        rows = ADBBridge(self._target).get_contacts(limit=self._limit)
+        rows = ADBBridge(self._target or None).get_contacts(limit=self._limit)
         self.done.emit(rows or [])
 
 
@@ -95,82 +101,91 @@ class CallsPage(QWidget):
         self._call_history = []
         self._contacts = []
         self._last_history_refresh = 0.0
-        self._call_muted = False
         self._history_busy = False
         self._history_worker = None
         self._contacts_busy = False
         self._contacts_worker = None
         self._call_route_worker = None
         self._call_route_context = {}
+        self._call_cleanup_busy = False
         self._call_started = False
         self._pc_route_requested = False
         self._pc_route_retry_after_connect_done = False
+        self._pending_dial_name = ""
         self._build()
         from backend.state import state
-        state.subscribe("call_audio_active", self._on_call_audio_state_changed)
-        state.subscribe("call_route_status", self._on_call_route_status_changed)
-        state.subscribe("call_ui_state", self._on_call_ui_state_changed)
-        self._on_call_route_status_changed(state.get("call_route_status", "phone"))
+        state.subscribe("call_route_ui_state", self._on_call_route_ui_state_changed, owner=self)
+        state.subscribe("call_ui_state", self._on_call_ui_state_changed, owner=self)
+        self._on_call_route_ui_state_changed(state.get("call_route_ui_state", {}))
         self.refresh()
 
-    def _on_call_audio_state_changed(self, active):
-        if hasattr(self, "_route_live_btn"):
-            self._route_live_btn.setProperty("active", bool(active))
-            self._route_live_btn.style().unpolish(self._route_live_btn)
-            self._route_live_btn.style().polish(self._route_live_btn)
-        self._update_live_controls()
-
-    def _on_call_route_status_changed(self, status):
+    def _on_call_route_ui_state_changed(self, payload):
         if not hasattr(self, "_call_route_hint"):
             return
-        s = str(status or "phone")
-        if s == "pending_pc":
-            self._call_route_hint.setText("Call Audio: Preparing laptop route...")
-            self._call_route_hint.setStyleSheet(f"color:{AMBER};font-size:10px;background:transparent;border:none;")
-            self._update_live_controls()
-            return
-        if s == "pc_active":
-            self._call_route_hint.setText("Call Audio: Laptop/PC")
-            self._call_route_hint.setStyleSheet(f"color:{TEAL};font-size:10px;background:transparent;border:none;")
-            self._update_live_controls()
-            return
-        if s == "pc_speaker_only":
-            self._call_route_hint.setText("Call Audio: Laptop/PC output (phone mic)")
-            self._call_route_hint.setStyleSheet(f"color:{AMBER};font-size:10px;background:transparent;border:none;")
-            self._update_live_controls()
-            return
-        if s == "pc_failed":
-            self._call_route_hint.setText("Call Audio: Phone (PC route failed)")
-            self._call_route_hint.setStyleSheet(f"color:{ROSE};font-size:10px;background:transparent;border:none;")
-            self._update_live_controls()
-            return
-        self._call_route_hint.setText("Call Audio: Phone")
-        self._call_route_hint.setStyleSheet(f"color:{TEXT_DIM};font-size:10px;background:transparent;border:none;")
-        self._update_live_controls()
+        row = dict(payload or {})
+        status = str(row.get("status") or "phone").strip().lower()
+        speaker = str(row.get("speaker_target") or "Phone").strip() or "Phone"
+        mic = str(row.get("mic_target") or "Phone").strip() or "Phone"
+        reason = str(row.get("reason") or "").strip()
+        if status == "pending":
+            text = "Route: Preparing laptop audio..."
+            color = AMBER
+        elif status == "laptop":
+            text = f"Route: {speaker} speaker · {mic} mic"
+            color = TEAL
+        elif status == "failed":
+            text = f"Route: Phone · {reason or 'laptop route failed'}"
+            color = ROSE
+        else:
+            text = f"Route: {speaker} speaker · {mic} mic"
+            color = TEXT_DIM
+        self._call_route_hint.setText(text)
+        self._call_route_hint.setStyleSheet(f"color:{color};font-size:10px;background:transparent;border:none;")
 
     def _on_call_ui_state_changed(self, payload):
         if not hasattr(self, "_call_state_hint"):
             return
         row = payload or {}
-        raw_status = str(row.get("status") or "idle").strip().lower()
+        raw_status = str(row.get("phase") or row.get("status") or "idle").strip().lower()
         status = raw_status.replace("_", " ").title()
         number = str(row.get("number") or "").strip()
-        name = str(row.get("contact_name") or "").strip()
+        name = str(row.get("display_name") or row.get("contact_name") or "").strip()
         who = name or number
         self._call_state_hint.setText(f"Call State: {status}{' · ' + who if who else ''}")
-        self._call_started = raw_status in {"talking", "active"}
+        # Keep live controls interactive through the whole active-call lifecycle,
+        # not only after "talking", so users can end/mute/route immediately.
+        self._call_started = raw_status in {
+            "dialing",
+            "ringing",
+            "incoming",
+            "callreceived",
+            "talking",
+            "active",
+        }
+
+        outbound_origin = state.get("outbound_call_origin", {}) or {}
+        origin_tag = str(state.get("call_origin", "unknown") or "unknown")
+        outbound_active = (
+            outbound_origin_active(outbound_origin, now_ms=int(time.time() * 1000))
+            or origin_tag == "calls_page_outbound"
+        )
+
+        # Incoming/on-phone calls must default to phone audio unless user explicitly
+        # requests transfer from the laptop UI.
+        if raw_status in {"ringing", "incoming", "callreceived"} and not outbound_active:
+            self._pc_route_requested = False
+            self._pc_route_retry_after_connect_done = False
+
         if raw_status in {"ended", "disconnected", "idle", "missed_call"}:
             self._pc_route_requested = False
             self._pc_route_retry_after_connect_done = False
-            if self._call_muted:
-                self._call_muted = False
-                self.adb.set_call_muted(False)
-                self._set_local_mic_mute(False)
-                if hasattr(self, "_mute_btn"):
-                    self._mute_btn.setText("Mute")
+            self._cancel_call_route_worker()
+            if bool(state.get("call_muted", False)):
+                self._clear_call_mute_async()
         if (
-            self._call_started
+            raw_status in {"talking", "active"}
             and self._pc_route_requested
+            and outbound_active
             and (self._call_route_worker is None)
             and not self._pc_route_retry_after_connect_done
             and (not bool(state.get("call_audio_active", False)))
@@ -180,7 +195,6 @@ class CallsPage(QWidget):
             state.set("call_route_reason", "Preparing laptop call audio...")
             state.set("call_route_backend", "none")
             self._start_call_route_attempt(number, who or number, intent="outbound_auto")
-        self._update_live_controls()
 
     def _build(self):
         layout = QVBoxLayout(self)
@@ -192,7 +206,7 @@ class CallsPage(QWidget):
         gl.setContentsMargins(16, 12, 16, 12)
         gl.setSpacing(4)
         gl.addWidget(section_label("Flow"))
-        gl.addWidget(lbl("1) Dial or choose contact  2) Answer/End from laptop  3) Use laptop audio if needed", 11, TEXT_DIM))
+        gl.addWidget(lbl("1) Dial or choose contact  2) In-call controls appear in the popup  3) History and contacts stay here", 11, TEXT_DIM))
         layout.addWidget(guide)
 
         # ── Dialpad ──────────────────────────────────────────────
@@ -255,23 +269,10 @@ class CallsPage(QWidget):
         call_row.addWidget(clear_btn)
         dl.addLayout(call_row)
 
-        live_row = QHBoxLayout()
-        live_row.setSpacing(8)
-        end_btn = action_btn("End", ROSE)
-        end_btn.clicked.connect(self._end_call)
-        self._mute_btn = action_btn("Mute", AMBER)
-        self._mute_btn.clicked.connect(self._toggle_live_mute)
-        self._route_live_btn = action_btn("Switch to Phone Audio", CYAN)
-        self._route_live_btn.clicked.connect(self._toggle_call_audio_route)
-        for btn in (end_btn, self._mute_btn, self._route_live_btn):
-            live_row.addWidget(btn)
-        dl.addLayout(live_row)
-        self._call_route_hint = lbl("Call Audio: Phone", 10, TEXT_DIM)
+        self._call_route_hint = lbl("Route: Phone speaker · Phone mic", 10, TEXT_DIM)
         self._call_state_hint = lbl("Call State: Idle", 10, TEXT_DIM)
         dl.addWidget(self._call_route_hint)
         dl.addWidget(self._call_state_hint)
-        self._end_btn = end_btn
-        self._update_live_controls()
         layout.addWidget(dial_frame)
 
         # ── Contacts ──────────────────────────────────────────────
@@ -366,28 +367,66 @@ class CallsPage(QWidget):
         number = self._dial_input.text().strip()
         if not number:
             return
+        display_name = str(self._pending_dial_name or number).strip() or number
         self._pc_route_requested = True
         self._pc_route_retry_after_connect_done = False
         state.set("outbound_call_origin", {
             "source": "calls_page",
             "number": number,
+            "display_name": display_name,
             "ts_ms": int(time.time() * 1000),
             "active": True,
         })
-        self.adb._run("shell", "am", "start",
-                       "-a", "android.intent.action.CALL",
-                       "-d", f"tel:{number}")
+        state.set("call_origin", "calls_page_outbound")
+        state.set("call_local_end_action", "")
+        state.set("call_muted", False)
         state.set("call_route_status", "phone")
         state.set("call_route_reason", "Call audio on phone until call is active")
         state.set("call_route_backend", "none")
-        state.set("call_ui_state", {
-            "status": "dialing",
-            "number": number,
-            "contact_name": number,
-            "audio_target": "pending_pc",
-            "updated_at": int(time.time() * 1000),
-        })
-        self._update_live_controls()
+        session = seed_outbound_call_session(
+            number,
+            display_name,
+            now_ms=int(time.time() * 1000),
+            origin="calls_page_outbound",
+            audio_target="pending_pc",
+        )
+        state.set("call_state", {"event": session.phase, "number": session.number, "contact_name": session.display_name})
+        state.set("call_ui_state", session.to_public_row())
+        self._launch_outbound_call_async(number)
+        # Show outbound popup immediately instead of waiting for DBus/offhook
+        # transitions, which can be delayed or flaky on some stacks.
+        win = self.window()
+        if win is not None and hasattr(win, "_on_call_received"):
+            try:
+                QTimer.singleShot(0, lambda n=number, d=display_name: win._on_call_received("ringing", n, d, source="user_action"))
+            except Exception:
+                pass
+        self._pending_dial_name = ""
+
+    def _launch_outbound_call_async(self, number: str):
+        dial_number = str(number or "").strip()
+        if not dial_number:
+            return
+
+        def _job():
+            ok, out = self.adb._run(
+                "shell",
+                "am",
+                "start",
+                "-a",
+                "android.intent.action.CALL",
+                "-d",
+                f"tel:{dial_number}",
+            )
+            if ok:
+                return
+            log.warning("Outbound call launch failed number=%s detail=%s", dial_number, str(out or "").strip())
+            try:
+                push_toast("Call launch failed", "warning", 1800)
+            except Exception:
+                log.debug("Failed pushing outbound call failure toast", exc_info=True)
+
+        threading.Thread(target=_job, daemon=True, name="pb-place-call").start()
 
     def _sync_contacts(self):
         self.kc.sync_contacts()
@@ -402,7 +441,7 @@ class CallsPage(QWidget):
             return
         self._contacts_busy = True
         self._contacts_list.addWidget(lbl("Loading contacts…", 12, TEXT_DIM))
-        self._contacts_worker = ContactsWorker(self.adb.target, limit=500)
+        self._contacts_worker = ContactsWorker("", limit=500)
         self._contacts_worker.done.connect(self._on_contacts_loaded)
         self._contacts_worker.finished.connect(self._contacts_worker.deleteLater)
         self._contacts_worker.start()
@@ -425,6 +464,7 @@ class CallsPage(QWidget):
                 "phone": phone,
             })
         self._contacts = deduped
+        state.set("call_contacts_cache", deduped)
         self._render_contacts(self._contacts)
 
     def _toggle_contacts_section(self):
@@ -512,76 +552,8 @@ class CallsPage(QWidget):
     def _call_contact(self, phone):
         if phone:
             self._dial_input.setText(phone)
+            self._pending_dial_name = next((c.get("name", "") for c in self._contacts if c.get("phone") == phone), "")
             self._place_call()
-
-    def _toggle_live_mute(self):
-        if not self._call_started:
-            return
-        self._call_muted = not self._call_muted
-        adb_ok = self.adb.set_call_muted(self._call_muted)
-        local_ok = self._set_local_mic_mute(self._call_muted) if bool(state.get("call_audio_active", False)) else False
-        ok = bool(adb_ok or local_ok)
-        self._mute_btn.setText("Unmute" if self._call_muted else "Mute")
-        if not ok and self._call_muted:
-            # Avoid toggle keyevents; they can desync mute state on some OEM builds.
-            self.adb.set_call_muted(False)
-            self._set_local_mic_mute(False)
-            self._call_muted = False
-            self._mute_btn.setText("Mute")
-        if ok:
-            push_toast("Call muted" if self._call_muted else "Call unmuted", "success" if self._call_muted else "info", 1400)
-        else:
-            push_toast("Mute may be blocked by device policy", "warning", 1900)
-
-    def _toggle_call_audio_route(self):
-        if not self._call_started:
-            push_toast("Call must be active before changing route", "info", 1500)
-            return
-        active = bool(state.get("call_audio_active", False))
-        pending = str(state.get("call_route_status", "")) == "pending_pc"
-        if active or pending or self._pc_route_requested:
-            self._pc_route_requested = False
-            self._pc_route_retry_after_connect_done = True
-            audio_route.set_source("call_pc_active", False)
-            audio_route.sync_result(call_retry_ms=0, suspend_ui_global=True)
-            self._release_bt_call_route()
-            state.set("call_ui_state", {
-                "status": "active",
-                "number": str((state.get("call_ui_state", {}) or {}).get("number") or ""),
-                "contact_name": str((state.get("call_ui_state", {}) or {}).get("contact_name") or ""),
-                "audio_target": "phone",
-                "updated_at": int(time.time() * 1000),
-            })
-            push_toast("Switched call audio to phone", "info", 1600)
-            self._update_live_controls()
-            return
-        self._pc_route_requested = True
-        self._pc_route_retry_after_connect_done = True
-        call_ui = state.get("call_ui_state", {}) or {}
-        number = str(call_ui.get("number") or self._dial_input.text().strip())
-        name = str(call_ui.get("contact_name") or number)
-        state.set("call_route_status", "pending_pc")
-        state.set("call_route_reason", "Preparing laptop call audio...")
-        state.set("call_route_backend", "none")
-        self._start_call_route_attempt(number, name, intent="transfer")
-        self._update_live_controls()
-
-    def _end_call(self):
-        if not self._call_started:
-            return
-        self.adb.end_call()
-        audio_route.set_source("call_pc_active", False)
-        audio_route.sync_result(call_retry_ms=0, suspend_ui_global=True)
-        state.set("outbound_call_origin", {})
-        self._pc_route_requested = False
-        self._pc_route_retry_after_connect_done = False
-        self._call_started = False
-        self._call_muted = False
-        self.adb.set_call_muted(False)
-        self._set_local_mic_mute(False)
-        if hasattr(self, "_mute_btn"):
-            self._mute_btn.setText("Mute")
-        self._update_live_controls()
 
     def _start_call_route_attempt(self, number, contact_name, *, intent):
         if self._call_route_worker is not None:
@@ -595,8 +567,6 @@ class CallsPage(QWidget):
             "contact_name": str(contact_name or number or ""),
             "intent": str(intent or "transfer"),
         }
-        if hasattr(self, "_route_live_btn"):
-            self._route_live_btn.setEnabled(False)
         worker = CallRouteWorker(preferred_name=str(contact_name or number or ""))
         self._call_route_worker = worker
         worker.done.connect(self._on_call_route_done)
@@ -609,13 +579,19 @@ class CallsPage(QWidget):
         contact_name = str(ctx.get("contact_name") or number)
         intent = str(ctx.get("intent") or "transfer")
         if result.ok and result.status == "active":
-            state.set("call_ui_state", {
-                "status": "active",
-                "number": number,
-                "contact_name": contact_name,
-                "audio_target": "pc",
-                "updated_at": int(time.time() * 1000),
-            })
+            row = dict(state.get("call_ui_state", {}) or {})
+            row.update(
+                {
+                    "phase": "talking",
+                    "status": "talking",
+                    "number": number,
+                    "display_name": contact_name,
+                    "contact_name": contact_name,
+                    "audio_target": "pc",
+                    "updated_at": int(time.time() * 1000),
+                }
+            )
+            state.set("call_ui_state", row)
             if intent == "outbound_auto":
                 push_toast(f"Calling {number} on laptop audio", "success", 1700)
             elif intent == "answer":
@@ -624,13 +600,19 @@ class CallsPage(QWidget):
                 push_toast("Transferred call audio to laptop", "success", 1600)
             return
         self._pc_route_requested = False
-        state.set("call_ui_state", {
-            "status": "active",
-            "number": number,
-            "contact_name": contact_name,
-            "audio_target": "phone",
-            "updated_at": int(time.time() * 1000),
-        })
+        row = dict(state.get("call_ui_state", {}) or {})
+        row.update(
+            {
+                "phase": "talking",
+                "status": "talking",
+                "number": number,
+                "display_name": contact_name,
+                "contact_name": contact_name,
+                "audio_target": "phone",
+                "updated_at": int(time.time() * 1000),
+            }
+        )
+        state.set("call_ui_state", row)
         state.set("call_route_status", "pc_failed")
         state.set("call_route_reason", str(result.reason or "Laptop call audio unavailable"))
         state.set("call_route_backend", "none")
@@ -640,35 +622,43 @@ class CallsPage(QWidget):
             push_toast("Call answered, but laptop audio route failed", "warning", 1900)
         else:
             push_toast("Could not switch call audio route", "warning", 1900)
-        self._update_live_controls()
 
     def _on_call_route_worker_finished(self, worker):
-        if hasattr(self, "_route_live_btn"):
-            self._route_live_btn.setEnabled(True)
         if self._call_route_worker is worker:
             self._call_route_worker = None
         try:
             worker.deleteLater()
         except RuntimeError:
             pass
-        self._update_live_controls()
 
-    def _update_live_controls(self):
-        started = bool(self._call_started)
-        route_active = bool(state.get("call_audio_active", False))
-        route_pending = str(state.get("call_route_status", "")) == "pending_pc"
-        phone_switch_mode = bool(self._pc_route_requested or route_active or route_pending)
+    def _cancel_call_route_worker(self):
+        worker = self._call_route_worker
+        if worker is None:
+            return
+        try:
+            if worker.isRunning():
+                worker.requestInterruption()
+                worker.terminate()
+        except Exception:
+            pass
+        self._call_route_worker = None
 
-        if hasattr(self, "_end_btn"):
-            self._end_btn.setEnabled(started)
-        if hasattr(self, "_mute_btn"):
-            self._mute_btn.setEnabled(started)
-        if hasattr(self, "_route_live_btn"):
-            if phone_switch_mode:
-                self._route_live_btn.setText("Switch to Phone Audio")
-            else:
-                self._route_live_btn.setText("Switch to Laptop Audio")
-            self._route_live_btn.setEnabled(started and self._call_route_worker is None)
+    def _clear_call_mute_async(self):
+        if self._call_cleanup_busy:
+            return
+        self._call_cleanup_busy = True
+
+        def _job():
+            try:
+                row = dict(state.get("call_ui_state", {}) or {})
+                phase = str(row.get("phase") or row.get("status") or "").strip().lower()
+                if phase in {"ringing", "talking", "dialing", "incoming", "callreceived", "active"}:
+                    return
+                call_controls.set_call_muted(False)
+            finally:
+                self._call_cleanup_busy = False
+
+        threading.Thread(target=_job, daemon=True, name="pb-call-mute-clear").start()
 
     @staticmethod
     def _release_bt_call_route() -> bool:
@@ -689,37 +679,16 @@ class CallsPage(QWidget):
         except Exception:
             return False
 
-    @staticmethod
-    def _set_local_mic_mute(muted: bool) -> bool:
-        try:
-            from backend import call_audio
-
-            if call_audio.set_input_muted(bool(muted)):
-                return True
-        except Exception:
-            pass
-        target = "1" if muted else "0"
-        commands = [
-            ["wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", target],
-            ["pactl", "set-source-mute", "@DEFAULT_SOURCE@", target],
-        ]
-        for cmd in commands:
-            try:
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
-                if res.returncode == 0:
-                    return True
-            except Exception:
-                continue
-        return False
-
     def add_call(self, event, number, contact_name):
         """Called by window when telephony signal fires"""
-        self._call_history.insert(0, {
+        entry = {
             "event": event,
             "number": number,
             "name": contact_name or number,
             "date_ms": int(time.time() * 1000),
-        })
+        }
+        self._call_history.insert(0, entry)
+        state.set("recent_calls_cache", list(self._call_history[:40]))
         self._refresh_history()
 
     def _refresh_history(self):
@@ -778,13 +747,13 @@ class CallsPage(QWidget):
         if self._history_busy:
             return
         self._history_busy = True
-        self._history_worker = CallsHistoryWorker(self.adb.target, limit=40)
+        self._history_worker = CallsHistoryWorker("", limit=40)
         self._history_worker.done.connect(self._on_history_loaded)
         self._history_worker.finished.connect(self._history_worker.deleteLater)
         self._history_worker.start()
 
     def _on_history_loaded(self, rows):
         self._history_busy = False
-        if rows:
-            self._call_history = rows
+        self._call_history = list(rows or [])
+        state.set("recent_calls_cache", self._call_history)
         self._refresh_history()

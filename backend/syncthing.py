@@ -6,12 +6,13 @@ import shutil
 import time
 import httpx
 import backend.settings_store as settings
+from backend import runtime_config
 
 
 def _read_key_from_syncthing_config() -> str:
     """Read the API key directly from ~/.config/syncthing/config.xml as fallback."""
     import xml.etree.ElementTree as ET
-    config_path = os.path.expanduser("~/.config/syncthing/config.xml")
+    config_path = str(runtime_config.syncthing_config_path())
     try:
         tree = ET.parse(config_path)
         el = tree.find(".//apikey")
@@ -23,17 +24,15 @@ def _read_key_from_syncthing_config() -> str:
 
 
 def resolve_syncthing_config():
-    url = str(settings.get("syncthing_url", "http://127.0.0.1:8384") or "").strip()
-    key = str(settings.get("syncthing_api_key", "") or "").strip()
-    if not url:
-        url = "http://127.0.0.1:8384"
+    url = runtime_config.syncthing_url()
+    key = runtime_config.syncthing_api_key()
     if not key:
         # Auto-discover from Syncthing's own config and persist it so future
         # calls don't need to re-parse config.xml.
         key = _read_key_from_syncthing_config()
         if key:
             settings.set("syncthing_api_key", key)
-    return url.rstrip("/"), key
+    return url, key
 
 
 class Syncthing:
@@ -181,6 +180,10 @@ class Syncthing:
         r = self._request("DELETE", ep, timeout=timeout)
         return bool(r and r.status_code in (200, 204))
 
+    def shutdown_api(self, timeout=6):
+        r = self._request("POST", "/rest/system/shutdown", timeout=timeout)
+        return bool(r and r.status_code in (200, 204))
+
     def is_running(self):
         # Keep backward compatibility: "running" now maps to service state,
         # not API reachability.
@@ -305,10 +308,27 @@ class Syncthing:
         return self._delete(f"/rest/config/folders/{folder_id}")
 
     def set_running(self, enabled: bool):
+        desired = bool(enabled)
+        if desired:
+            try:
+                current = self.service_state()
+            except Exception:
+                current = {}
+            if str(current.get("unit_file_state") or "").strip() == "masked":
+                try:
+                    subprocess.run(
+                        ["systemctl", "--user", "unmask", "syncthing.service"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                except Exception:
+                    return False
+
         cmd = [
             "systemctl",
             "--user",
-            "start" if enabled else "stop",
+            "start" if desired else "stop",
             "syncthing.service",
         ]
         try:
@@ -316,7 +336,6 @@ class Syncthing:
         except Exception:
             return False
         deadline = time.time() + 5.0
-        desired = bool(enabled)
         last = self.is_service_active()
         while time.time() < deadline:
             last = self.is_service_active()

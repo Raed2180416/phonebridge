@@ -4,6 +4,7 @@ set -euo pipefail
 # Run the project venv on NixOS with foreign-wheel runtime libs + dbus module.
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_PY="$ROOT_DIR/.venv/bin/python"
+RUNTIME_LAUNCHER="$ROOT_DIR/run-venv-runtime.sh"
 
 SELF_CHECK=0
 if [[ "${1:-}" == "--self-check" ]]; then
@@ -12,6 +13,9 @@ if [[ "${1:-}" == "--self-check" ]]; then
 fi
 
 if [[ ! -x "$VENV_PY" ]]; then
+  if [[ -x "$RUNTIME_LAUNCHER" ]]; then
+    exec "$RUNTIME_LAUNCHER" "$@"
+  fi
   echo "Missing venv python: $VENV_PY" >&2
   exit 1
 fi
