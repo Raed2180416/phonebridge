@@ -23,6 +23,7 @@ def _reset_audio_route(monkeypatch):
     monkeypatch.setattr(audio_route.settings, "set", lambda key, value: store.__setitem__(key, value))
     monkeypatch.setattr(audio_route.settings, "get", lambda key, default=None: store.get(key, default))
     monkeypatch.setattr(audio_route.state, "set", lambda key, value: store.__setitem__(key, value))
+    monkeypatch.setattr(audio_route.state, "set_many", lambda values: store.update(dict(values or {})))
     monkeypatch.setattr(audio_route.state, "get", lambda key, default=None: store.get(key, default))
 
     audio_route._sources.clear()

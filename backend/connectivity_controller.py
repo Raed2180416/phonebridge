@@ -22,6 +22,8 @@ _LOCKS = {
     "kde": threading.Lock(),
     "syncthing": threading.Lock(),
 }
+_ACTIVE_LOCK = threading.Lock()
+_ACTIVE_OP: str | None = None
 
 
 def _set_busy(op: str, busy: bool) -> None:
@@ -32,18 +34,33 @@ def _set_busy(op: str, busy: bool) -> None:
     state.update("connectivity_ops_busy", _update, default={})
 
 
+def _set_active_op(op: str | None) -> None:
+    state.set("connectivity_active_op", str(op or ""))
+
+
 def _try_begin(op: str) -> threading.Lock | None:
+    global _ACTIVE_OP
     lock = _LOCKS.get(op)
     if lock is None:
         return None
-    if not lock.acquire(blocking=False):
-        return None
+    with _ACTIVE_LOCK:
+        if _ACTIVE_OP is not None:
+            return None
+        if not lock.acquire(blocking=False):
+            return None
+        _ACTIVE_OP = op
     _set_busy(op, True)
+    _set_active_op(op)
     return lock
 
 
 def _end(op: str, lock: threading.Lock | None) -> None:
+    global _ACTIVE_OP
     _set_busy(op, False)
+    with _ACTIVE_LOCK:
+        if _ACTIVE_OP == op:
+            _ACTIVE_OP = None
+            _set_active_op(None)
     if lock is None:
         return
     try:

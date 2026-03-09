@@ -39,6 +39,25 @@ log = logging.getLogger(__name__)
 
 
 class WindowRuntimeMixin:
+    def _ensure_runtime_async_state(self):
+        if not hasattr(self, "_runtime_async_lock"):
+            self._runtime_async_lock = threading.Lock()
+        if not hasattr(self, "_audio_route_sync_busy"):
+            self._audio_route_sync_busy = False
+        if not hasattr(self, "_audio_route_sync_pending"):
+            self._audio_route_sync_pending = False
+        if not hasattr(self, "_audio_route_sync_pending_suspend"):
+            self._audio_route_sync_pending_suspend = False
+        if not hasattr(self, "_call_state_poll_busy"):
+            self._call_state_poll_busy = False
+        if not hasattr(self, "_call_state_poll_pending"):
+            self._call_state_poll_pending = False
+        if not hasattr(self, "_notif_sync_busy"):
+            self._notif_sync_busy = False
+        if not hasattr(self, "_notif_sync_pending"):
+            self._notif_sync_pending = False
+        return self._runtime_async_lock
+
     @staticmethod
     def _call_identity_fingerprint(number: str, display_name: str = "") -> str:
         key = phone_match_key(number)
@@ -441,15 +460,16 @@ class WindowRuntimeMixin:
     def _publish_call_session(self, session) -> None:
         if session is None:
             return
-        state.set(
-            "call_state",
+        state.set_many(
             {
-                "event": session.phase,
-                "number": session.number,
-                "contact_name": session.display_name,
-            },
+                "call_state": {
+                    "event": session.phase,
+                    "number": session.number,
+                    "contact_name": session.display_name,
+                },
+                "call_ui_state": session.to_public_row(),
+            }
         )
-        state.set("call_ui_state", session.to_public_row())
 
     def _ensure_call_popup(self, *, force_new: bool = False):
         if force_new and self._call_popup is not None:
@@ -847,26 +867,44 @@ class WindowRuntimeMixin:
         return False
 
     def _sync_audio_route_async(self, *, suspend_ui_global: bool):
-        if self._audio_route_sync_busy:
-            return
-        self._audio_route_sync_busy = True
+        next_suspend = bool(suspend_ui_global)
+        with self._ensure_runtime_async_state():
+            if self._audio_route_sync_busy:
+                self._audio_route_sync_pending = True
+                self._audio_route_sync_pending_suspend = bool(
+                    self._audio_route_sync_pending_suspend or next_suspend
+                )
+                return
+            self._audio_route_sync_busy = True
 
         def _job():
             try:
-                audio_route.sync(suspend_ui_global=bool(suspend_ui_global))
+                audio_route.sync(suspend_ui_global=next_suspend)
             except Exception:
                 log.exception("Async audio-route sync failed")
             finally:
-                self._audio_route_sync_busy = False
+                rerun = False
+                rerun_suspend = False
+                with self._ensure_runtime_async_state():
+                    self._audio_route_sync_busy = False
+                    rerun = bool(self._audio_route_sync_pending)
+                    rerun_suspend = bool(self._audio_route_sync_pending_suspend)
+                    self._audio_route_sync_pending = False
+                    self._audio_route_sync_pending_suspend = False
+                if rerun:
+                    self._sync_audio_route_async(suspend_ui_global=rerun_suspend)
 
         threading.Thread(target=_job, daemon=True, name="pb-audio-sync").start()
 
     def _poll_phone_call_state_async(self):
-        if self._call_state_poll_busy:
-            return
+        with self._ensure_runtime_async_state():
+            if self._call_state_poll_busy:
+                self._call_state_poll_pending = True
+                return
         if time.time() < self._suspend_poll_until:
             return
-        self._call_state_poll_busy = True
+        with self._ensure_runtime_async_state():
+            self._call_state_poll_busy = True
 
         def _job():
             try:
@@ -879,65 +917,78 @@ class WindowRuntimeMixin:
         threading.Thread(target=_job, daemon=True, name="pb-call-poll").start()
 
     def _apply_polled_call_state(self, call_state: str):
-        self._call_state_poll_busy = False
-        now_s = time.time()
-        previous_non_unknown_state = str(getattr(self, "_last_non_unknown_polled_call_state", "unknown") or "unknown")
-        plan = plan_polled_call_state(
-            call_state,
-            previous_state=self._last_polled_call_state,
-            route_suspended=self._call_state_route_suspended,
-            call_ui=state.get("call_ui_state", {}) or {},
-            suppress_calls=bool(settings.get("suppress_calls", False)),
-            now_s=now_s,
-        )
-        if hasattr(self, "_call_controller") and self._call_controller is not None:
-            self._call_controller.note_polled_state(plan.call_state)
-        if plan.state_changed:
-            log.info("Polled phone call state=%s", plan.call_state)
-            self._last_polled_call_state = plan.call_state
-            self._last_polled_at = now_s
-            if plan.call_state != "unknown":
-                self._last_non_unknown_polled_call_state = plan.call_state
-                self._last_non_unknown_polled_at = self._last_polled_at
-        self._observe_polled_live_state(plan.call_state, now_s=now_s)
-        if plan.should_synthesize_from_notifications:
-            self._maybe_synthesize_call_from_notifications(trigger_reason="poll")
-            return
-
-        if plan.sync_audio_suspend:
-            self._sync_audio_route_async(suspend_ui_global=True)
-        elif plan.sync_audio_restore and self._call_state_route_suspended:
-            self._sync_audio_route_async(suspend_ui_global=self._mirror_stream_running())
-        self._call_state_route_suspended = plan.next_route_suspended
-
-        if plan.call_state == "ringing" and self._polled_ringing_edge_can_open_session(previous_non_unknown_state=previous_non_unknown_state):
-            contact_name = str(plan.contact_name or "").strip()
-            if not str(plan.number or "").strip() and (not contact_name or contact_name.lower() == "unknown"):
-                contact_name = "Incoming call"
-            if bool(settings.get("suppress_calls", False)):
-                self._publish_call_snapshot("ringing", plan.number, contact_name, "phone", source="telephony_poll")
-            else:
-                self._on_call_received("incoming_call", plan.number, contact_name, source="telephony_poll")
-        elif plan.call_state == "idle" and self._session_should_finalize_from_idle(now_s=now_s):
-            current = getattr(self, "_call_session_state", None)
-            self._cancel_poll_popup_fallback()
-            self._on_call_received(
-                "ended",
-                str(getattr(current, "number", "") or ""),
-                str(getattr(current, "display_name", "") or ""),
-                source="verification",
+        rerun_poll = False
+        with self._ensure_runtime_async_state():
+            self._call_state_poll_busy = False
+        try:
+            now_s = time.time()
+            previous_non_unknown_state = str(getattr(self, "_last_non_unknown_polled_call_state", "unknown") or "unknown")
+            plan = plan_polled_call_state(
+                call_state,
+                previous_state=self._last_polled_call_state,
+                route_suspended=self._call_state_route_suspended,
+                call_ui=state.get("call_ui_state", {}) or {},
+                suppress_calls=bool(settings.get("suppress_calls", False)),
+                now_s=now_s,
             )
-        elif plan.action == "ended":
-            self._cancel_poll_popup_fallback()
-            self._on_call_received("ended", plan.number, plan.contact_name, source="verification")
+            if hasattr(self, "_call_controller") and self._call_controller is not None:
+                self._call_controller.note_polled_state(plan.call_state)
+            if plan.state_changed:
+                log.info("Polled phone call state=%s", plan.call_state)
+                self._last_polled_call_state = plan.call_state
+                self._last_polled_at = now_s
+                if plan.call_state != "unknown":
+                    self._last_non_unknown_polled_call_state = plan.call_state
+                    self._last_non_unknown_polled_at = self._last_polled_at
+            self._observe_polled_live_state(plan.call_state, now_s=now_s)
+            if plan.should_synthesize_from_notifications:
+                self._maybe_synthesize_call_from_notifications(trigger_reason="poll")
+                return
+
+            if plan.sync_audio_suspend:
+                self._sync_audio_route_async(suspend_ui_global=True)
+            elif plan.sync_audio_restore and self._call_state_route_suspended:
+                self._sync_audio_route_async(suspend_ui_global=self._mirror_stream_running())
+            self._call_state_route_suspended = plan.next_route_suspended
+
+            if plan.call_state == "ringing" and self._polled_ringing_edge_can_open_session(previous_non_unknown_state=previous_non_unknown_state):
+                contact_name = str(plan.contact_name or "").strip()
+                if not str(plan.number or "").strip() and (not contact_name or contact_name.lower() == "unknown"):
+                    contact_name = "Incoming call"
+                if bool(settings.get("suppress_calls", False)):
+                    self._publish_call_snapshot("ringing", plan.number, contact_name, "phone", source="telephony_poll")
+                else:
+                    self._on_call_received("incoming_call", plan.number, contact_name, source="telephony_poll")
+            elif plan.call_state == "idle" and self._session_should_finalize_from_idle(now_s=now_s):
+                current = getattr(self, "_call_session_state", None)
+                self._cancel_poll_popup_fallback()
+                self._on_call_received(
+                    "ended",
+                    str(getattr(current, "number", "") or ""),
+                    str(getattr(current, "display_name", "") or ""),
+                    source="verification",
+                )
+            elif plan.action == "ended":
+                self._cancel_poll_popup_fallback()
+                self._on_call_received("ended", plan.number, plan.contact_name, source="verification")
+        finally:
+            with self._ensure_runtime_async_state():
+                if self._call_state_poll_pending and time.time() >= self._suspend_poll_until:
+                    self._call_state_poll_pending = False
+                    rerun_poll = True
+            if rerun_poll:
+                QTimer.singleShot(0, self._poll_phone_call_state_async)
 
     def _sync_notification_mirror_snapshot(self):
-        if self._notif_sync_busy:
-            return
+        with self._ensure_runtime_async_state():
+            if self._notif_sync_busy:
+                self._notif_sync_pending = True
+                return
         if not settings.get("kde_integration_enabled", True):
             sync_desktop_notifications([])
             return
-        self._notif_sync_busy = True
+        with self._ensure_runtime_async_state():
+            self._notif_sync_busy = True
 
         def _job():
             try:
@@ -949,7 +1000,13 @@ class WindowRuntimeMixin:
             except Exception:
                 log.exception("Notification mirror snapshot sync failed")
             finally:
-                self._notif_sync_busy = False
+                rerun = False
+                with self._ensure_runtime_async_state():
+                    self._notif_sync_busy = False
+                    rerun = bool(self._notif_sync_pending)
+                    self._notif_sync_pending = False
+                if rerun:
+                    self._sync_notification_mirror_snapshot()
 
         threading.Thread(target=_job, daemon=True).start()
 

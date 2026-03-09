@@ -35,16 +35,23 @@ class DBusSignalBridge(QObject):
     def __init__(self):
         super().__init__()
         self._loop = None
+        self._thread = None
+        self._bus = None
+        self._kc = None
         self._running = False
+        self._stopping = False
 
     def start(self):
         import threading
 
+        if self._running:
+            return
         if not _HAVE_DBUS:
             raise RuntimeError("python-dbus/gi not available; KDE integration disabled")
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
         self._loop = GLib.MainLoop()
         self._running = True
+        self._stopping = False
 
         from backend.kdeconnect import KDEConnect
 
@@ -52,14 +59,14 @@ class DBusSignalBridge(QObject):
         self._register_all_signals(self._kc)
 
         try:
-            bus = dbus.SessionBus()
-            bus.watch_name_owner("org.kde.kdeconnect", self._on_kde_name_owner_changed)
+            self._bus = dbus.SessionBus()
+            self._bus.watch_name_owner("org.kde.kdeconnect", self._on_kde_name_owner_changed)
             log.info("Watching NameOwnerChanged for org.kde.kdeconnect")
         except Exception as exc:
             log.warning("NameOwnerChanged watch failed: %s", exc)
 
-        thread = threading.Thread(target=self._loop.run, daemon=True)
-        thread.start()
+        self._thread = threading.Thread(target=self._loop.run, daemon=True, name="pb-dbus-glib")
+        self._thread.start()
         log.info("DBusSignalBridge started (GLib loop in background thread)")
 
     def _register_all_signals(self, kc):
@@ -74,7 +81,7 @@ class DBusSignalBridge(QObject):
         kc.connect_clipboard_signal(self._on_clipboard_received)
 
     def _on_kde_name_owner_changed(self, new_owner):
-        if not self._running:
+        if (not self._running) or self._stopping:
             return
         if not new_owner:
             log.info("org.kde.kdeconnect lost from bus (daemon stopped)")
@@ -93,7 +100,9 @@ class DBusSignalBridge(QObject):
             log.exception("Failed to re-register signals after NameOwnerChanged")
 
     def stop(self):
-        self._running = False
+        if not self._running and self._thread is None and self._loop is None:
+            return
+        self._stopping = True
         old_kc = getattr(self, "_kc", None)
         if old_kc is not None and hasattr(old_kc, "disconnect_all_signals"):
             try:
@@ -105,6 +114,18 @@ class DBusSignalBridge(QObject):
                 self._loop.quit()
             except Exception:
                 log.exception("Failed stopping DBus GLib loop")
+        thread = getattr(self, "_thread", None)
+        if thread is not None:
+            try:
+                thread.join(timeout=1.5)
+            except Exception:
+                log.exception("Failed joining DBus GLib loop thread")
+        self._thread = None
+        self._loop = None
+        self._kc = None
+        self._bus = None
+        self._running = False
+        self._stopping = False
 
     def _on_call(self, *args):
         if not self._running:

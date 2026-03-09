@@ -1,4 +1,4 @@
-"""Audit coverage for async runtime and connectivity risk patterns."""
+"""Audit coverage for remediated runtime and connectivity behavior."""
 
 from __future__ import annotations
 
@@ -48,20 +48,20 @@ def _load_connectivity_controller(monkeypatch):
     return importlib.import_module("backend.connectivity_controller")
 
 
-def test_sync_audio_route_async_drops_follow_up_request_while_busy():
-    started = threading.Event()
-    release = threading.Event()
+def test_sync_audio_route_async_coalesces_follow_up_request_and_merges_suspend_flags():
+    release_first = threading.Event()
     calls = []
 
     class _AudioRoute:
         @staticmethod
         def sync(*, suspend_ui_global):
             calls.append(bool(suspend_ui_global))
-            started.set()
-            release.wait(1.0)
+            if len(calls) == 1:
+                release_first.wait(1.0)
 
     shim_cls = _build_shim(
         "ui/window_runtime.py",
+        "_ensure_runtime_async_state",
         "_sync_audio_route_async",
         global_ns={
             "audio_route": _AudioRoute,
@@ -71,23 +71,27 @@ def test_sync_audio_route_async_drops_follow_up_request_while_busy():
     )
     shim = shim_cls()
     shim._audio_route_sync_busy = False
+    shim._audio_route_sync_pending = False
+    shim._audio_route_sync_pending_suspend = False
+    shim._runtime_async_lock = threading.Lock()
 
     shim._sync_audio_route_async(suspend_ui_global=True)
-    assert started.wait(1.0)
     shim._sync_audio_route_async(suspend_ui_global=False)
+    shim._sync_audio_route_async(suspend_ui_global=True)
 
-    release.set()
+    release_first.set()
     deadline = time.time() + 1.0
-    while shim._audio_route_sync_busy and time.time() < deadline:
+    while len(calls) < 2 and time.time() < deadline:
         time.sleep(0.01)
 
-    assert calls == [True]
+    assert calls == [True, True]
     assert shim._audio_route_sync_busy is False
+    assert shim._audio_route_sync_pending is False
+    assert shim._audio_route_sync_pending_suspend is False
 
 
-def test_sync_notification_snapshot_drops_second_refresh_while_busy(monkeypatch):
-    started = threading.Event()
-    release = threading.Event()
+def test_sync_notification_snapshot_coalesces_second_refresh(monkeypatch):
+    release_first = threading.Event()
     get_calls = []
     mirrored = []
     state_updates = []
@@ -107,8 +111,8 @@ def test_sync_notification_snapshot_drops_second_refresh_while_busy(monkeypatch)
     class _FakeKDEConnect:
         def get_notifications(self):
             get_calls.append("get_notifications")
-            started.set()
-            release.wait(1.0)
+            if len(get_calls) == 1:
+                release_first.wait(1.0)
             return [{"id": "n1"}]
 
     fake_mod = types.ModuleType("backend.kdeconnect")
@@ -117,6 +121,7 @@ def test_sync_notification_snapshot_drops_second_refresh_while_busy(monkeypatch)
 
     shim_cls = _build_shim(
         "ui/window_runtime.py",
+        "_ensure_runtime_async_state",
         "_sync_notification_mirror_snapshot",
         global_ns={
             "settings": _FakeSettings,
@@ -129,44 +134,60 @@ def test_sync_notification_snapshot_drops_second_refresh_while_busy(monkeypatch)
     )
     shim = shim_cls()
     shim._notif_sync_busy = False
+    shim._notif_sync_pending = False
+    shim._runtime_async_lock = threading.Lock()
 
     shim._sync_notification_mirror_snapshot()
-    assert started.wait(1.0)
     shim._sync_notification_mirror_snapshot()
 
-    release.set()
+    release_first.set()
     deadline = time.time() + 1.0
-    while shim._notif_sync_busy and time.time() < deadline:
+    while len(get_calls) < 2 and time.time() < deadline:
         time.sleep(0.01)
 
-    assert get_calls == ["get_notifications"]
-    assert mirrored == [[{"id": "n1"}]]
-    assert state_updates == [("notifications", [{"id": "n1"}])]
+    assert get_calls == ["get_notifications", "get_notifications"]
+    assert mirrored == [[{"id": "n1"}], [{"id": "n1"}]]
+    assert state_updates == [
+        ("notifications", [{"id": "n1"}]),
+        ("notifications", [{"id": "n1"}]),
+    ]
+    assert shim._notif_sync_pending is False
 
 
-def test_poll_phone_call_state_async_drops_second_poll_while_busy():
-    started = threading.Event()
-    release = threading.Event()
+def test_poll_phone_call_state_async_coalesces_trailing_poll():
+    release_first = threading.Event()
     adb_calls = []
     emitted = []
+
+    class _Plan:
+        call_state = "idle"
+        state_changed = False
+        next_route_suspended = False
+        should_synthesize_from_notifications = False
+        sync_audio_suspend = False
+        sync_audio_restore = False
+        action = ""
+        number = ""
+        contact_name = ""
 
     class _FakeADB:
         @staticmethod
         def get_call_state_fast():
             adb_calls.append("poll")
-            started.set()
-            release.wait(1.0)
+            if len(adb_calls) == 1:
+                release_first.wait(1.0)
             return "ringing"
-
-    class _Signal:
-        @staticmethod
-        def emit(value):
-            emitted.append(value)
 
     shim_cls = _build_shim(
         "ui/window_runtime.py",
+        "_ensure_runtime_async_state",
         "_poll_phone_call_state_async",
+        "_apply_polled_call_state",
         global_ns={
+            "QTimer": type("QTimer", (), {"singleShot": staticmethod(lambda _delay, callback: callback())}),
+            "plan_polled_call_state": lambda *_a, **_kw: _Plan(),
+            "settings": types.SimpleNamespace(get=lambda *_a, **_kw: False),
+            "state": types.SimpleNamespace(get=lambda *_a, **_kw: {}, set=lambda *_a, **_kw: None),
             "threading": threading,
             "time": time,
             "log": logging.getLogger("audit"),
@@ -174,21 +195,40 @@ def test_poll_phone_call_state_async_drops_second_poll_while_busy():
     )
     shim = shim_cls()
     shim._call_state_poll_busy = False
+    shim._call_state_poll_pending = False
     shim._suspend_poll_until = 0.0
+    shim._runtime_async_lock = threading.Lock()
     shim._adb = _FakeADB()
+    shim._last_polled_call_state = "unknown"
+    shim._call_state_route_suspended = False
+    shim._call_controller = None
+    shim._observe_polled_live_state = lambda *_a, **_kw: None
+    shim._maybe_synthesize_call_from_notifications = lambda **_kw: None
+    shim._mirror_stream_running = lambda: False
+    shim._polled_ringing_edge_can_open_session = lambda **_kw: False
+    shim._publish_call_snapshot = lambda *_a, **_kw: None
+    shim._on_call_received = lambda *_a, **_kw: None
+    shim._session_should_finalize_from_idle = lambda **_kw: False
+    shim._cancel_poll_popup_fallback = lambda: None
+
+    class _Signal:
+        def emit(self, value):
+            emitted.append(value)
+            shim._apply_polled_call_state(value)
+
     shim._call_state_ready = _Signal()
 
     shim._poll_phone_call_state_async()
-    assert started.wait(1.0)
     shim._poll_phone_call_state_async()
 
-    release.set()
+    release_first.set()
     deadline = time.time() + 1.0
-    while shim._call_state_poll_busy and time.time() < deadline:
+    while len(adb_calls) < 2 and time.time() < deadline:
         time.sleep(0.01)
 
-    assert adb_calls == ["poll"]
-    assert emitted == ["ringing"]
+    assert adb_calls == ["poll", "poll"]
+    assert emitted == ["ringing", "ringing"]
+    assert shim._call_state_poll_pending is False
 
 
 def test_connectivity_same_operation_lock_rejects_reentry(monkeypatch):
@@ -203,35 +243,39 @@ def test_connectivity_same_operation_lock_rejects_reentry(monkeypatch):
         controller._end("wifi", first)
 
 
-def test_connectivity_cross_operation_locks_allow_overlap(monkeypatch):
+def test_connectivity_cross_operation_locks_are_serialized(monkeypatch):
     controller = _load_connectivity_controller(monkeypatch)
     controller.state.set("connectivity_ops_busy", {})
+    controller.state.set("connectivity_active_op", "")
     wifi_lock = controller._try_begin("wifi")
     bt_lock = controller._try_begin("bluetooth")
     try:
         assert wifi_lock is not None
-        assert bt_lock is not None
+        assert bt_lock is None
         busy = controller.state.get("connectivity_ops_busy", {}) or {}
         assert busy.get("wifi") is True
-        assert busy.get("bluetooth") is True
+        assert busy.get("bluetooth") is not True
+        assert controller.state.get("connectivity_active_op", "") == "wifi"
     finally:
         controller._end("wifi", wifi_lock)
         controller._end("bluetooth", bt_lock)
+    assert controller.state.get("connectivity_active_op", "") == ""
 
 
-def test_clipboard_controller_source_uses_blocking_subprocess_polling():
-    method_src = _method_source("ui/runtime_controllers.py", "_read_wayland_clipboard_text")
-    assert "subprocess.run(" in method_src
-    assert "timeout=0.5" in method_src
+def test_clipboard_controller_reads_cached_wayland_text_and_moves_subprocess_work_to_helper():
+    method_src = _method_source("ui/runtime_controllers.py", "_read_current_text")
+    helper_src = _method_source("ui/runtime_controllers.py", "_poll_wayland_clipboard_text")
+    assert "subprocess.run(" not in method_src
+    assert "self._schedule_wayland_clipboard_refresh()" in method_src
+    assert "subprocess.run(" in helper_src
 
 
-def test_dbus_signal_bridge_start_and_stop_do_not_track_or_join_worker_thread():
+def test_dbus_signal_bridge_tracks_and_joins_worker_thread():
     start_src = _method_source("ui/window_support.py", "start")
     stop_src = _method_source("ui/window_support.py", "stop")
 
-    assert "thread = threading.Thread(" in start_src
-    assert "self._thread" not in start_src
-    assert ".join(" not in stop_src
+    assert "self._thread = threading.Thread(" in start_src
+    assert "thread.join(" in stop_src
 
 
 @pytest.mark.parametrize(
@@ -245,4 +289,9 @@ def test_dbus_signal_bridge_start_and_stop_do_not_track_or_join_worker_thread():
 def test_window_runtime_busy_paths_return_early_when_already_busy(method_name, busy_flag):
     method_src = _method_source("ui/window_runtime.py", method_name)
     assert f"if self.{busy_flag}:" in method_src
-    assert any("return" in line for line in method_src.splitlines()[1:4])
+    if method_name == "_sync_audio_route_async":
+        assert "self._audio_route_sync_pending = True" in method_src
+    elif method_name == "_poll_phone_call_state_async":
+        assert "self._call_state_poll_pending = True" in method_src
+    else:
+        assert "self._notif_sync_pending = True" in method_src

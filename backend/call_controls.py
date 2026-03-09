@@ -15,6 +15,13 @@ class CallMuteResult:
     reason: str = ""
 
 
+@dataclass
+class CallActionResult:
+    ok: bool
+    action: str
+    reason: str = ""
+
+
 def _set_local_mic_mute(muted: bool) -> bool:
     try:
         from backend import call_audio
@@ -49,6 +56,32 @@ def _route_label() -> str:
     return "phone" if _phone_route_active() else "laptop"
 
 
+def answer_call() -> CallActionResult:
+    ok = bool(ADBBridge().answer_call())
+    return CallActionResult(ok=ok, action="answer", reason="" if ok else "answer command failed")
+
+
+def end_call() -> CallActionResult:
+    ok = bool(ADBBridge().end_call())
+    return CallActionResult(ok=ok, action="end", reason="" if ok else "end command failed")
+
+
+def place_call(number: str) -> CallActionResult:
+    dial_number = str(number or "").strip()
+    if not dial_number:
+        return CallActionResult(ok=False, action="call", reason="missing number")
+    ok, out = ADBBridge()._run(
+        "shell",
+        "am",
+        "start",
+        "-a",
+        "android.intent.action.CALL",
+        "-d",
+        f"tel:{dial_number}",
+    )
+    return CallActionResult(ok=bool(ok), action="call", reason="" if ok else str(out or "call command failed").strip())
+
+
 def set_call_muted(muted: bool) -> CallMuteResult:
     desired = bool(muted)
     route = _route_label()
@@ -74,4 +107,3 @@ def set_call_muted(muted: bool) -> CallMuteResult:
         state.set("call_muted", desired)
         return CallMuteResult(ok=True, route=route)
     return CallMuteResult(ok=False, route=route, reason="mute command failed")
-

@@ -57,7 +57,17 @@ def _run_systemctl(*args: str) -> tuple[bool, str]:
 def _runtime_launcher_contents(project_root: Path) -> str:
     venv_python = project_root / ".venv" / "bin" / "python"
     return (
-        "#!/usr/bin/env bash\n"
+        "#!/bin/sh\n"
+        "if [ -z \"${BASH_VERSION:-}\" ]; then\n"
+        "  if [ -x /run/current-system/sw/bin/bash ]; then\n"
+        "    exec /run/current-system/sw/bin/bash \"$0\" \"$@\"\n"
+        "  fi\n"
+        "  if command -v bash >/dev/null 2>&1; then\n"
+        "    exec \"$(command -v bash)\" \"$0\" \"$@\"\n"
+        "  fi\n"
+        "  echo \"bash is required but was not found.\" >&2\n"
+        "  exit 127\n"
+        "fi\n"
         "set -euo pipefail\n"
         'RUNTIME_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
         f'VENV_PY="{venv_python}"\n'

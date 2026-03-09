@@ -112,9 +112,12 @@ def ensure_hyprland_toggle_binding(project_root: Path) -> tuple[bool, str]:
         return False, "Hyprland config not found; skipped SUPER+P binding"
     bind_conf = config_dir / "phonebridge.conf"
     main_conf = config_dir / "hyprland.conf"
-    toggle_script = project_root / "scripts" / "phonebridge-toggle.sh"
-    if toggle_script.exists():
-        toggle_cmd = f"{toggle_script}"
+    runtime_toggle_script = autostart._runtime_current_path() / "scripts" / "phonebridge-toggle.sh"
+    repo_toggle_script = project_root / "scripts" / "phonebridge-toggle.sh"
+    if runtime_toggle_script.exists():
+        toggle_cmd = f"{runtime_toggle_script}"
+    elif repo_toggle_script.exists():
+        toggle_cmd = f"{repo_toggle_script}"
     else:
         toggle_cmd = f"{autostart.preferred_launcher(project_root)} --toggle"
 

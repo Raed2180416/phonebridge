@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import subprocess
+import shutil
 
 from backend import dev_runtime_watch
 
@@ -96,3 +99,21 @@ def test_build_tree_signature_ignores_artifacts(tmp_path):
     assert "ui/window.py" in snapshot
     assert ".git/index" not in snapshot
     assert "tests/hardware/.artifacts/live.json" not in snapshot
+
+
+def test_dev_runtime_watch_script_runs_without_bash_on_path():
+    script = Path("scripts/dev_runtime_watch.sh").resolve()
+    env = os.environ.copy()
+    dirname_bin = Path(shutil.which("dirname")).resolve().parent
+    env["PATH"] = str(dirname_bin)
+
+    proc = subprocess.run(
+        [str(script), "--self-check"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "root=" in proc.stdout

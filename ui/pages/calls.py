@@ -55,6 +55,17 @@ class CallRouteWorker(QThread):
         super().__init__()
         self._preferred_name = str(preferred_name or "")
 
+    def _cancel_requested(self) -> bool:
+        return bool(self.isInterruptionRequested())
+
+    @staticmethod
+    def _cancel_route() -> None:
+        audio_route.set_source("call_pc_active", False)
+        try:
+            audio_route.sync_result(call_retry_ms=0, suspend_ui_global=True)
+        except Exception:
+            pass
+
     def _prepare_bt_call_route(self):
         try:
             from backend.bluetooth_manager import BluetoothManager
@@ -79,16 +90,25 @@ class CallRouteWorker(QThread):
             return
 
     def run(self):
+        if self._cancel_requested():
+            self._cancel_route()
+            return
         self._prepare_bt_call_route()
+        if self._cancel_requested():
+            self._cancel_route()
+            return
         audio_route.set_source("call_pc_active", True)
         result = audio_route.sync_result(
             call_retry_ms=8000,
             retry_step_ms=300,
             suspend_ui_global=True,
+            cancel_check=self._cancel_requested,
         )
+        if result.status == "cancelled":
+            self._cancel_route()
+            return
         if not result.ok:
-            audio_route.set_source("call_pc_active", False)
-            audio_route.sync_result(call_retry_ms=0, suspend_ui_global=True)
+            self._cancel_route()
         self.done.emit(result)
 
 
@@ -106,7 +126,7 @@ class CallsPage(QWidget):
         self._contacts_busy = False
         self._contacts_worker = None
         self._call_route_worker = None
-        self._call_route_context = {}
+        self._call_route_request_id = 0
         self._call_cleanup_busy = False
         self._call_started = False
         self._pc_route_requested = False
@@ -165,9 +185,11 @@ class CallsPage(QWidget):
 
         outbound_origin = state.get("outbound_call_origin", {}) or {}
         origin_tag = str(state.get("call_origin", "unknown") or "unknown")
+        live_outbound_origin = outbound_origin_active(outbound_origin, now_ms=int(time.time() * 1000))
+        origin_outbound = origin_tag == "calls_page_outbound" and raw_status in {"dialing", "talking", "active"}
         outbound_active = (
-            outbound_origin_active(outbound_origin, now_ms=int(time.time() * 1000))
-            or origin_tag == "calls_page_outbound"
+            live_outbound_origin
+            or origin_outbound
         )
 
         # Incoming/on-phone calls must default to phone audio unless user explicitly
@@ -191,9 +213,13 @@ class CallsPage(QWidget):
             and (not bool(state.get("call_audio_active", False)))
         ):
             self._pc_route_retry_after_connect_done = True
-            state.set("call_route_status", "pending_pc")
-            state.set("call_route_reason", "Preparing laptop call audio...")
-            state.set("call_route_backend", "none")
+            state.set_many(
+                {
+                    "call_route_status": "pending_pc",
+                    "call_route_reason": "Preparing laptop call audio...",
+                    "call_route_backend": "none",
+                }
+            )
             self._start_call_route_attempt(number, who or number, intent="outbound_auto")
 
     def _build(self):
@@ -370,19 +396,23 @@ class CallsPage(QWidget):
         display_name = str(self._pending_dial_name or number).strip() or number
         self._pc_route_requested = True
         self._pc_route_retry_after_connect_done = False
-        state.set("outbound_call_origin", {
-            "source": "calls_page",
-            "number": number,
-            "display_name": display_name,
-            "ts_ms": int(time.time() * 1000),
-            "active": True,
-        })
-        state.set("call_origin", "calls_page_outbound")
-        state.set("call_local_end_action", "")
-        state.set("call_muted", False)
-        state.set("call_route_status", "phone")
-        state.set("call_route_reason", "Call audio on phone until call is active")
-        state.set("call_route_backend", "none")
+        state.set_many(
+            {
+                "outbound_call_origin": {
+                    "source": "calls_page",
+                    "number": number,
+                    "display_name": display_name,
+                    "ts_ms": int(time.time() * 1000),
+                    "active": True,
+                },
+                "call_origin": "calls_page_outbound",
+                "call_local_end_action": "",
+                "call_muted": False,
+                "call_route_status": "phone",
+                "call_route_reason": "Call audio on phone until call is active",
+                "call_route_backend": "none",
+            }
+        )
         session = seed_outbound_call_session(
             number,
             display_name,
@@ -390,8 +420,16 @@ class CallsPage(QWidget):
             origin="calls_page_outbound",
             audio_target="pending_pc",
         )
-        state.set("call_state", {"event": session.phase, "number": session.number, "contact_name": session.display_name})
-        state.set("call_ui_state", session.to_public_row())
+        state.set_many(
+            {
+                "call_state": {
+                    "event": session.phase,
+                    "number": session.number,
+                    "contact_name": session.display_name,
+                },
+                "call_ui_state": session.to_public_row(),
+            }
+        )
         self._launch_outbound_call_async(number)
         # Show outbound popup immediately instead of waiting for DBus/offhook
         # transitions, which can be delayed or flaky on some stacks.
@@ -562,19 +600,24 @@ class CallsPage(QWidget):
                     return
             except RuntimeError:
                 self._call_route_worker = None
-        self._call_route_context = {
+        request_id = self._call_route_request_id + 1
+        self._call_route_request_id = request_id
+        ctx = {
             "number": str(number or ""),
             "contact_name": str(contact_name or number or ""),
             "intent": str(intent or "transfer"),
         }
         worker = CallRouteWorker(preferred_name=str(contact_name or number or ""))
+        worker._request_context = ctx
         self._call_route_worker = worker
-        worker.done.connect(self._on_call_route_done)
-        worker.finished.connect(lambda: self._on_call_route_worker_finished(worker))
+        worker.done.connect(lambda result, rid=request_id, w=worker: self._on_call_route_done(result, rid, w))
+        worker.finished.connect(lambda rid=request_id, w=worker: self._on_call_route_worker_finished(w, rid))
         worker.start()
 
-    def _on_call_route_done(self, result):
-        ctx = dict(self._call_route_context or {})
+    def _on_call_route_done(self, result, request_id, worker):
+        if request_id != self._call_route_request_id or self._call_route_worker is not worker:
+            return
+        ctx = dict(getattr(worker, "_request_context", {}) or {})
         number = str(ctx.get("number") or "")
         contact_name = str(ctx.get("contact_name") or number)
         intent = str(ctx.get("intent") or "transfer")
@@ -591,7 +634,16 @@ class CallsPage(QWidget):
                     "updated_at": int(time.time() * 1000),
                 }
             )
-            state.set("call_ui_state", row)
+            state.set_many(
+                {
+                    "call_state": {
+                        "event": "talking",
+                        "number": number,
+                        "contact_name": contact_name,
+                    },
+                    "call_ui_state": row,
+                }
+            )
             if intent == "outbound_auto":
                 push_toast(f"Calling {number} on laptop audio", "success", 1700)
             elif intent == "answer":
@@ -612,10 +664,19 @@ class CallsPage(QWidget):
                 "updated_at": int(time.time() * 1000),
             }
         )
-        state.set("call_ui_state", row)
-        state.set("call_route_status", "pc_failed")
-        state.set("call_route_reason", str(result.reason or "Laptop call audio unavailable"))
-        state.set("call_route_backend", "none")
+        state.set_many(
+            {
+                "call_state": {
+                    "event": "talking",
+                    "number": number,
+                    "contact_name": contact_name,
+                },
+                "call_ui_state": row,
+                "call_route_status": "pc_failed",
+                "call_route_reason": str(result.reason or "Laptop call audio unavailable"),
+                "call_route_backend": "none",
+            }
+        )
         if intent == "outbound_auto":
             push_toast(f"Calling {number} (laptop audio unavailable)", "warning", 2000)
         elif intent == "answer":
@@ -623,8 +684,8 @@ class CallsPage(QWidget):
         else:
             push_toast("Could not switch call audio route", "warning", 1900)
 
-    def _on_call_route_worker_finished(self, worker):
-        if self._call_route_worker is worker:
+    def _on_call_route_worker_finished(self, worker, request_id):
+        if self._call_route_worker is worker and request_id == self._call_route_request_id:
             self._call_route_worker = None
         try:
             worker.deleteLater()
@@ -635,13 +696,15 @@ class CallsPage(QWidget):
         worker = self._call_route_worker
         if worker is None:
             return
+        self._call_route_request_id += 1
+        self._call_route_worker = None
         try:
             if worker.isRunning():
                 worker.requestInterruption()
-                worker.terminate()
+                audio_route.set_source("call_pc_active", False)
+                worker.wait(800)
         except Exception:
             pass
-        self._call_route_worker = None
 
     def _clear_call_mute_async(self):
         if self._call_cleanup_busy:

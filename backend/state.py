@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import copy
 import itertools
 import logging
 import threading
@@ -78,6 +79,7 @@ class AppState:
             "connection_status": {},
             "connectivity_status": {},
             "connectivity_ops_busy": {},
+            "connectivity_active_op": "",
             "ui_toast_queue": [],
             "notif_revision": {},
             "notif_open_request": {},
@@ -88,34 +90,51 @@ class AppState:
         }
         self._listeners: dict[str, dict[int, Callable[[Any], None]]] = defaultdict(dict)
         self._listener_ids = itertools.count(1)
+        self._dispatch_depth = 0
+        self._pending_notifications: list[tuple[str, Any, list[tuple[int, Callable[[Any], None]]]]] = []
+
+    @staticmethod
+    def _clone_value(value: Any) -> Any:
+        if isinstance(value, (dict, list, set, tuple)):
+            try:
+                return copy.deepcopy(value)
+            except Exception:
+                log.debug("AppState deep copy failed; falling back to original value", exc_info=True)
+        return value
 
     def get(self, key: str, default: Any = None) -> Any:
         with self._lock:
-            return self._data.get(key, default)
+            value = self._data.get(key, default)
+        return self._clone_value(value)
 
     def set(self, key: str, value: Any) -> None:
         with self._lock:
-            self._data[key] = value
+            stored = self._clone_value(value)
+            self._data[key] = stored
             listeners = list(self._listeners.get(key, {}).items())
-        self._notify_listeners(key, value, listeners)
+        self._queue_notifications([(key, self._clone_value(stored), listeners)])
+
+    def set_many(self, values: dict[str, Any]) -> None:
+        notifications: list[tuple[str, Any, list[tuple[int, Callable[[Any], None]]]]] = []
+        with self._lock:
+            for key, raw_value in dict(values or {}).items():
+                stored = self._clone_value(raw_value)
+                self._data[key] = stored
+                listeners = list(self._listeners.get(key, {}).items())
+                notifications.append((key, self._clone_value(stored), listeners))
+        self._queue_notifications(notifications)
 
     def update(self, key: str, updater: Callable[[Any], Any], default: Any = None) -> Any:
         with self._lock:
             current = self._data.get(key, default)
-            if isinstance(current, dict):
-                working = dict(current)
-            elif isinstance(current, list):
-                working = list(current)
-            elif isinstance(current, set):
-                working = set(current)
-            else:
-                working = current
+            working = self._clone_value(current)
             updated = updater(working)
             value = working if updated is None else updated
-            self._data[key] = value
+            stored = self._clone_value(value)
+            self._data[key] = stored
             listeners = list(self._listeners.get(key, {}).items())
-        self._notify_listeners(key, value, listeners)
-        return value
+        self._queue_notifications([(key, self._clone_value(stored), listeners)])
+        return self._clone_value(stored)
 
     def subscribe(self, key: str, callback: Callable[[Any], None], *, owner: Any = None) -> Callable[[], None]:
         with self._lock:
@@ -176,6 +195,25 @@ class AppState:
                 log.exception("AppState queued listener failed key=%s", key)
 
         _QT_BRIDGE.emit(_deliver, value)
+
+    def _queue_notifications(
+        self,
+        notifications: list[tuple[str, Any, list[tuple[int, Callable[[Any], None]]]]],
+    ) -> None:
+        if not notifications:
+            return
+        with self._lock:
+            self._pending_notifications.extend(notifications)
+            if self._dispatch_depth:
+                return
+            self._dispatch_depth = 1
+        while True:
+            with self._lock:
+                if not self._pending_notifications:
+                    self._dispatch_depth = 0
+                    return
+                key, value, listeners = self._pending_notifications.pop(0)
+            self._notify_listeners(key, value, listeners)
 
     @staticmethod
     def _should_queue_listener() -> bool:

@@ -128,7 +128,9 @@ class PhoneBridgeWindow(WindowRuntimeMixin, QMainWindow):
         self._last_polled_at = 0.0
         self._last_non_unknown_polled_call_state = "unknown"
         self._last_non_unknown_polled_at = 0.0
+        self._runtime_async_lock = threading.Lock()
         self._call_state_poll_busy = False
+        self._call_state_poll_pending = False
         self._call_state_route_suspended = False
         self._call_session_state = None
         self._call_terminal_timer = QTimer(self)
@@ -137,8 +139,11 @@ class PhoneBridgeWindow(WindowRuntimeMixin, QMainWindow):
         # Wire cross-thread delivery: background ADB poll → Qt main thread
         self._call_state_ready.connect(self._apply_polled_call_state)
         self._audio_route_sync_busy = False
+        self._audio_route_sync_pending = False
+        self._audio_route_sync_pending_suspend = False
         self._mobile_data_policy_busy = False
         self._notif_sync_busy = False
+        self._notif_sync_pending = False
         self._build_ui()
         self._apply_global_audio_route_startup()
         self._build_toast_layer()

@@ -4,9 +4,10 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import threading
 import time
 
-from PyQt6.QtCore import QObject, QTimer
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtGui import QClipboard
 from PyQt6.QtWidgets import QApplication
 
@@ -121,13 +122,19 @@ class NotificationController(QObject):
 class ClipboardController(QObject):
     """Owns clipboard sync, history persistence, and Wayland safety polling."""
 
+    _wayland_text_ready = pyqtSignal(str)
+
     def __init__(self, parent: QObject):
         super().__init__(parent)
         self._connected = False
         self._last_clipboard_text = ""
         self._clipboard_history = sanitize_clipboard_history(settings.get("clipboard_history", []) or [])
+        self._wayland_clipboard_cache = ""
+        self._wayland_poll_busy = False
+        self._wayland_poll_pending = False
         settings.set("clipboard_history", self._clipboard_history)
         state.set("clipboard_history", self._clipboard_history)
+        self._wayland_text_ready.connect(self._on_wayland_text_ready)
 
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._on_local_clipboard_changed)
@@ -187,11 +194,28 @@ class ClipboardController(QObject):
             except Exception:
                 text = ""
         if not text:
+            self._schedule_wayland_clipboard_refresh()
             text = self._read_wayland_clipboard_text()
         return str(text or "")
 
+    def _read_wayland_clipboard_text(self) -> str:
+        return str(self._wayland_clipboard_cache or "")
+
+    def _schedule_wayland_clipboard_refresh(self) -> None:
+        if not os.environ.get("WAYLAND_DISPLAY"):
+            return
+        if self._wayland_poll_busy:
+            self._wayland_poll_pending = True
+            return
+        self._wayland_poll_busy = True
+
+        def _job():
+            self._wayland_text_ready.emit(self._poll_wayland_clipboard_text())
+
+        threading.Thread(target=_job, daemon=True, name="pb-wayland-clipboard").start()
+
     @staticmethod
-    def _read_wayland_clipboard_text() -> str:
+    def _poll_wayland_clipboard_text() -> str:
         if not os.environ.get("WAYLAND_DISPLAY"):
             return ""
         for args in (["wl-paste", "--no-newline"], ["wl-paste", "--primary", "--no-newline"]):
@@ -208,6 +232,19 @@ class ClipboardController(QObject):
             except Exception:
                 log.debug("ClipboardController wl-paste failed args=%s", args, exc_info=True)
         return ""
+
+    def _on_wayland_text_ready(self, text: str) -> None:
+        value = str(text or "")
+        self._wayland_clipboard_cache = value
+        self._wayland_poll_busy = False
+        rerun = self._wayland_poll_pending
+        self._wayland_poll_pending = False
+        if value and value != self._last_clipboard_text:
+            self._last_clipboard_text = value
+            state.set("clipboard_text", value)
+            self._push_history(value, source="pc")
+        if rerun:
+            self._schedule_wayland_clipboard_refresh()
 
     def _push_history(self, text: str, *, source: str) -> None:
         value = str(text or "").strip()

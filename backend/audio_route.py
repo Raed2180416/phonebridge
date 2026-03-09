@@ -8,6 +8,7 @@ import signal
 import threading
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 from backend.adb_bridge import ADBBridge
 import backend.settings_store as settings
@@ -96,17 +97,25 @@ class _ExternalBTRouteProc:
         return None
 
 # Initialize state
-state.set("audio_redirect_enabled", _sources["ui_global_toggle"])
-state.set("call_audio_active", _sources["call_pc_active"])
-state.set("call_route_status", "phone")
-state.set("call_route_reason", "")
-state.set("call_route_backend", "none")
+state.set_many(
+    {
+        "audio_redirect_enabled": _sources["ui_global_toggle"],
+        "call_audio_active": _sources["call_pc_active"],
+        "call_route_status": "phone",
+        "call_route_reason": "",
+        "call_route_backend": "none",
+    }
+)
 
 
 def _set_call_route_state(status: str, reason: str = "", backend: str = "none") -> None:
-    state.set("call_route_status", status)
-    state.set("call_route_reason", reason)
-    state.set("call_route_backend", backend)
+    state.set_many(
+        {
+            "call_route_status": status,
+            "call_route_reason": reason,
+            "call_route_backend": backend,
+        }
+    )
 
 
 def _restore_call_audio_session_if_needed() -> None:
@@ -590,18 +599,27 @@ def _desired_mode(*, suspend_ui_global: bool = False) -> str | None:
     return None
 
 
-def _wait_for_bt_call_mic_path(call_retry_ms: int, retry_step_ms: int) -> bool:
+def _wait_for_bt_call_mic_path(
+    call_retry_ms: int,
+    retry_step_ms: int,
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+) -> bool | None:
     if _bt_call_mic_path_active():
         return True
     timeout_ms = max(0, int(call_retry_ms or 0))
     if timeout_ms <= 0:
-        return False
+        return None if callable(cancel_check) and cancel_check() else False
     step_ms = max(50, int(retry_step_ms or 300))
     deadline = time.time() + (timeout_ms / 1000.0)
     while time.time() < deadline:
+        if callable(cancel_check) and cancel_check():
+            return None
         time.sleep(step_ms / 1000.0)
         if _bt_call_mic_path_active():
             return True
+    if callable(cancel_check) and cancel_check():
+        return None
     return _bt_call_mic_path_active()
 
 
@@ -630,8 +648,14 @@ def _call_route_active_result(reason: str = "Bluetooth call mic path is active")
         log.exception("Failed applying saved call-audio settings")
     _boost_call_mic_gain()
     backend = active_backend()
-    state.set("call_audio_active", True)
-    _set_call_route_state("pc_active", "Audio on laptop/PC", backend)
+    state.set_many(
+        {
+            "call_audio_active": True,
+            "call_route_status": "pc_active",
+            "call_route_reason": "Audio on laptop/PC",
+            "call_route_backend": backend,
+        }
+    )
     _start_call_route_watchdog()  # monitor mic path while call is active
     return RouteSyncResult(
         ok=True,
@@ -643,8 +667,14 @@ def _call_route_active_result(reason: str = "Bluetooth call mic path is active")
 
 
 def _call_route_pending_result(reason: str = "Waiting for Bluetooth call mic path") -> RouteSyncResult:
-    state.set("call_audio_active", False)
-    _set_call_route_state("pending_pc", reason, "none")
+    state.set_many(
+        {
+            "call_audio_active": False,
+            "call_route_status": "pending_pc",
+            "call_route_reason": reason,
+            "call_route_backend": "none",
+        }
+    )
     return RouteSyncResult(
         ok=False,
         status="pending",
@@ -655,12 +685,37 @@ def _call_route_pending_result(reason: str = "Waiting for Bluetooth call mic pat
 
 
 def _call_route_failed_result(reason: str) -> RouteSyncResult:
-    state.set("call_audio_active", False)
     _stop_call_route_watchdog()
-    _set_call_route_state("pc_failed", reason, "none")
+    state.set_many(
+        {
+            "call_audio_active": False,
+            "call_route_status": "pc_failed",
+            "call_route_reason": reason,
+            "call_route_backend": "none",
+        }
+    )
     return RouteSyncResult(
         ok=False,
         status="failed",
+        mode="audio",
+        backend="none",
+        reason=reason,
+    )
+
+
+def _call_route_cancelled_result(reason: str = "Route request was cancelled") -> RouteSyncResult:
+    _stop_call_route_watchdog()
+    state.set_many(
+        {
+            "call_audio_active": False,
+            "call_route_status": "phone",
+            "call_route_reason": "",
+            "call_route_backend": "none",
+        }
+    )
+    return RouteSyncResult(
+        ok=False,
+        status="cancelled",
         mode="audio",
         backend="none",
         reason=reason,
@@ -673,7 +728,10 @@ def sync_result(
     suspend_ui_global: bool = False,
     call_retry_ms: int = 0,
     retry_step_ms: int = 300,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> RouteSyncResult:
+    if callable(cancel_check) and cancel_check():
+        return _call_route_cancelled_result()
     want_mode = _desired_mode(suspend_ui_global=suspend_ui_global)
     running = _is_running()
     end_call_session = (want_mode != "audio") and (not bool(_sources.get("call_pc_active", False)))
@@ -716,7 +774,14 @@ def sync_result(
         if running and _audio_mode == want_mode:
             if _bt_call_mic_path_active():
                 return _call_route_active_result()
-            if _wait_for_bt_call_mic_path(call_retry_ms, retry_step_ms):
+            wait_result = _wait_for_bt_call_mic_path(
+                call_retry_ms,
+                retry_step_ms,
+                cancel_check=cancel_check,
+            )
+            if wait_result is None:
+                return _call_route_cancelled_result()
+            if wait_result:
                 return _call_route_active_result()
             if int(call_retry_ms or 0) > 0:
                 return _call_route_failed_result("Bluetooth call mic path not detected in time")
@@ -724,7 +789,14 @@ def sync_result(
 
         # Some devices expose the BT call mic path even when profile probes are
         # flaky. Prefer observed mic-path readiness over profile heuristics.
-        if _wait_for_bt_call_mic_path(call_retry_ms, retry_step_ms):
+        wait_result = _wait_for_bt_call_mic_path(
+            call_retry_ms,
+            retry_step_ms,
+            cancel_check=cancel_check,
+        )
+        if wait_result is None:
+            return _call_route_cancelled_result()
+        if wait_result:
             started = _start_proc("audio", adb=adb)
             if started and _bt_call_mic_path_active():
                 return _call_route_active_result()

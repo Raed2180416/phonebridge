@@ -1,4 +1,14 @@
-#!/usr/bin/env bash
+#!/bin/sh
+if [ -z "${BASH_VERSION:-}" ]; then
+    if [ -x /run/current-system/sw/bin/bash ]; then
+        exec /run/current-system/sw/bin/bash "$0" "$@"
+    fi
+    if command -v bash >/dev/null 2>&1; then
+        exec "$(command -v bash)" "$0" "$@"
+    fi
+    echo "bash is required but was not found." >&2
+    exit 127
+fi
 # Fast IPC relay for keybinds — no steam-run/bwrap overhead.
 # Sends 'toggle' directly to the running PhoneBridge socket (<50 ms).
 # Falls back to the installed immutable runtime launcher if the app isn't running.

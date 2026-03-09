@@ -171,14 +171,33 @@ class BTRouteWorker(QThread):
         self.preferred_name = preferred_name or ""
         self.auto_connect = bool(auto_connect)
 
+    def _cancel_requested(self) -> bool:
+        return bool(self.isInterruptionRequested())
+
+    def _cancel_route(self) -> None:
+        audio_route.set_source("call_pc_active", False)
+        try:
+            audio_route.sync_result(
+                call_retry_ms=0,
+                suspend_ui_global=True,
+            )
+        except Exception:
+            pass
+
     def run(self):
         mac = self._resolve_device_mac()
         hfp_ready = False
 
+        if self._cancel_requested():
+            self._cancel_route()
+            return
         self.step_update.emit(0, "pending")
         if not self._check_bt_enabled():
             self.step_update.emit(0, "fail")
             self.route_failed.emit("Bluetooth is not enabled", "Enable BT in Network or Dashboard")
+            return
+        if self._cancel_requested():
+            self._cancel_route()
             return
 
         connected = self._check_bt_connected(mac)
@@ -190,6 +209,9 @@ class BTRouteWorker(QThread):
             return
         self.step_update.emit(0, "ok")
 
+        if self._cancel_requested():
+            self._cancel_route()
+            return
         self.step_update.emit(1, "pending")
         hfp_ready = self._arm_hfp_profile()
         if hfp_ready:
@@ -197,21 +219,23 @@ class BTRouteWorker(QThread):
         else:
             self.step_update.emit(1, "pending")
 
+        if self._cancel_requested():
+            self._cancel_route()
+            return
         self.step_update.emit(2, "pending")
         audio_route.set_source("call_pc_active", True)
         result = audio_route.sync_result(
             call_retry_ms=12_000,
             retry_step_ms=300,
             suspend_ui_global=True,
+            cancel_check=self._cancel_requested,
         )
         if result.status == "cancelled":
-            audio_route.set_source("call_pc_active", False)
-            audio_route.sync_result(call_retry_ms=0, suspend_ui_global=True)
+            self._cancel_route()
             return
         if (not result.ok) or (result.status != "active"):
             self.step_update.emit(2, "fail")
-            audio_route.set_source("call_pc_active", False)
-            audio_route.sync_result(call_retry_ms=0, suspend_ui_global=True)
+            self._cancel_route()
             reason = str(result.reason or "")
             if ("profile" in reason.lower() or "a2dp" in reason.lower()) and (not hfp_ready):
                 self.route_failed.emit("BT call profile unavailable", "Only A2DP detected")
@@ -220,14 +244,16 @@ class BTRouteWorker(QThread):
             else:
                 self.route_failed.emit("BT device not reachable", reason or "Device did not respond")
             return
+        if self._cancel_requested():
+            self._cancel_route()
+            return
         if audio_route._bt_call_mic_path_active():
             self.step_update.emit(2, "ok")
             self.route_success.emit()
             return
         if not self._check_mic_node():
             self.step_update.emit(2, "fail")
-            audio_route.set_source("call_pc_active", False)
-            audio_route.sync_result(call_retry_ms=0, suspend_ui_global=True)
+            self._cancel_route()
             self.route_failed.emit("No BT mic input node detected", "BT mic not found via pw-dump/pactl")
             return
         self.step_update.emit(2, "ok")

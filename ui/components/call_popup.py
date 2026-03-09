@@ -54,6 +54,7 @@ class CallPopup(CallPopupSessionMixin, QWidget):
     # QTimer.singleShot(0,...) from a non-Qt thread is silently dropped
     # in this bwrap/Wayland environment; pyqtSignal is the only safe path.
     _poll_state_ready = pyqtSignal(str)
+    _popup_action_ready = pyqtSignal(object)
 
     def __init__(self, parent_window: QWidget | None = None):
         # Pass parent to QWidget so Wayland creates a transient child surface
@@ -76,6 +77,9 @@ class CallPopup(CallPopupSessionMixin, QWidget):
         self._last_event_key = ""
         self._last_event_ts = 0.0
         self._ringing_started_at = 0.0
+        self._popup_action_busy = False
+        self._popup_action_token_counter = 0
+        self._active_popup_action_token = 0
         self._call_session_token = 0
         self._auto_route_applied = False
         self._is_outbound_call = False
@@ -124,6 +128,7 @@ class CallPopup(CallPopupSessionMixin, QWidget):
         self._on_call_route_ui_state_changed(state.get("call_route_ui_state", {}))
         self._on_call_muted_changed(state.get("call_muted", False))
         self._poll_state_ready.connect(self._apply_polled_call_state)
+        self._popup_action_ready.connect(self._on_popup_action_completed)
         # NOTE: QWidget starts hidden by default; do NOT call self.hide()
         # here.  On Wayland, calling hide() on a never-shown widget can
         # destroy the nascent platform window and prevent show() from
@@ -832,15 +837,16 @@ class CallPopup(CallPopupSessionMixin, QWidget):
                 "updated_at": int(time.time() * 1000),
             }
         )
-        state.set(
-            "call_state",
+        state.set_many(
             {
-                "event": str(row.get("status") or "ended"),
-                "number": self.current_number,
-                "contact_name": self.current_contact,
-            },
+                "call_state": {
+                    "event": str(row.get("status") or "ended"),
+                    "number": self.current_number,
+                    "contact_name": self.current_contact,
+                },
+                "call_ui_state": row,
+            }
         )
-        state.set("call_ui_state", row)
 
     def _begin_call_session(self):
         self._call_session_token += 1

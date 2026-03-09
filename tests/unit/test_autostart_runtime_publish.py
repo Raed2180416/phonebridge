@@ -74,6 +74,21 @@ def test_publish_runtime_refreshes_existing_desktop_entry(tmp_path, monkeypatch)
     assert desktop_calls == [project.resolve()]
 
 
+def test_publish_runtime_launcher_bootstraps_bash_without_env_lookup(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    runtime_base = tmp_path / "runtime"
+    _make_project(project)
+
+    monkeypatch.setattr(autostart, "_runtime_base_path", lambda: runtime_base)
+
+    current, launcher = autostart.publish_runtime(str(project))
+
+    assert current == runtime_base / "current"
+    text = launcher.read_text(encoding="utf-8")
+    assert text.startswith("#!/bin/sh\n")
+    assert "/run/current-system/sw/bin/bash" in text
+
+
 def test_publish_runtime_failure_does_not_move_current(tmp_path, monkeypatch):
     project = tmp_path / "project"
     runtime_base = tmp_path / "runtime"

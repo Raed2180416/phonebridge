@@ -19,6 +19,123 @@ log = logging.getLogger(__name__)
 
 
 class CallPopupSessionMixin:
+    def _set_action_controls_enabled(self, enabled: bool) -> None:
+        for widget_name in ("primary_btn", "secondary_btn", "reply_btn", "phone_option", "laptop_option"):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.setEnabled(bool(enabled))
+
+    def _start_popup_action(self, action: str, job, *, keep_origin_on_failure: bool = False):
+        if bool(getattr(self, "_popup_action_busy", False)):
+            return False
+        self._popup_action_busy = True
+        self._popup_action_token_counter += 1
+        token = self._popup_action_token_counter
+        self._active_popup_action_token = token
+        self._set_action_controls_enabled(False)
+
+        def _run():
+            try:
+                payload = job()
+            except Exception as exc:
+                payload = {"ok": False, "reason": str(exc or f"{action} failed")}
+            self._popup_action_ready.emit(
+                {
+                    "token": token,
+                    "action": str(action or ""),
+                    "payload": payload,
+                }
+            )
+
+        threading.Thread(target=_run, daemon=True, name=f"pb-popup-{action}").start()
+        return True
+
+    def _on_popup_action_completed(self, payload: dict | None) -> None:
+        row = dict(payload or {})
+        token = int(row.get("token") or 0)
+        if token != int(getattr(self, "_active_popup_action_token", 0) or 0):
+            return
+        self._active_popup_action_token = 0
+        self._popup_action_busy = False
+        self._set_action_controls_enabled(True)
+
+        action = str(row.get("action") or "").strip().lower()
+        result = dict(row.get("payload") or {})
+        ok = bool(result.get("ok", False))
+        reason = str(result.get("reason") or "").strip()
+
+        if action == "answer":
+            if ok:
+                self._enter_talking(reset_timer=True)
+            else:
+                state.set("call_origin", "unknown")
+                self._push_action_toast(reason or "Could not answer call", level="warning", duration_ms=1800)
+            return
+        if action == "reject":
+            if ok:
+                self.dismiss_active_call()
+            else:
+                state.set("call_local_end_action", "")
+                self._push_action_toast(reason or "Could not reject call", level="warning", duration_ms=1800)
+            return
+        if action == "end":
+            if ok:
+                self.dismiss_active_call()
+            else:
+                state.set("call_local_end_action", "")
+                self._push_action_toast(reason or "Could not end call", level="warning", duration_ms=1800)
+            return
+        if action == "mute":
+            desired = bool(result.get("desired", False))
+            route_result = result.get("result")
+            self.secondary_btn.setChecked(bool(state.get("call_muted", False)))
+            self.secondary_btn.setStyleSheet(self._button_style("mute", active=bool(state.get("call_muted", False))))
+            if getattr(route_result, "ok", False):
+                self._push_action_toast("Muted" if desired else "Unmuted", level="info", duration_ms=1300)
+            else:
+                route = str(getattr(route_result, "route", "") or "")
+                self._push_action_toast(
+                    "Mute failed on laptop route" if route == "laptop" else "Mute command unsupported on this Android build",
+                    level="warning",
+                    duration_ms=1800,
+                )
+            return
+        if action == "call_back":
+            if ok:
+                self._is_outbound_call = True
+                self._enter_ringing()
+            else:
+                self._push_action_toast(reason or "Call launch failed", level="warning", duration_ms=1800)
+            return
+        if action == "sms_reply":
+            if ok:
+                self._teardown_route()
+                state.set("sms_draft_number", self.current_number or "")
+                self._publish_state("ended", "phone")
+                if self.parent_window and hasattr(self.parent_window, "go_to"):
+                    self.parent_window.go_to("messages")
+                self._push_action_toast("Opening SMS composer…", level="info", duration_ms=1500)
+                self.hide_popup()
+            else:
+                self._push_action_toast(reason or "Could not open SMS composer", level="warning", duration_ms=1800)
+
+    @staticmethod
+    def _push_action_toast(message: str, *, level: str, duration_ms: int) -> None:
+        try:
+            from backend.ui_feedback import push_toast
+
+            push_toast(message, level, duration_ms)
+        except Exception:
+            log.debug("Failed pushing popup action toast", exc_info=True)
+
+    @staticmethod
+    def _call_action_payload(result) -> dict[str, object]:
+        return {
+            "ok": bool(getattr(result, "ok", False)),
+            "reason": str(getattr(result, "reason", "") or ""),
+            "result": result,
+        }
+
     def _start_state_watcher(self):
         # The window runtime owns call-state polling and terminal resolution.
         # Running a second popup-local ADB poller creates duplicate telephony
@@ -158,9 +275,13 @@ class CallPopupSessionMixin:
 
         if origin in {"calls_page_outbound", "popup_answer_laptop"}:
             self._set_laptop_pending()
-            state.set("call_route_status", "pending_pc")
-            state.set("call_route_reason", "Preparing laptop call audio...")
-            state.set("call_route_backend", "none")
+            state.set_many(
+                {
+                    "call_route_status": "pending_pc",
+                    "call_route_reason": "Preparing laptop call audio...",
+                    "call_route_backend": "none",
+                }
+            )
             self._publish_state("ringing", "pending_pc")
         else:
             self._set_phone_selected(reset_failure=True)
@@ -178,9 +299,13 @@ class CallPopupSessionMixin:
                 return
             self._set_laptop_pending()
             if route_status != "pending_pc":
-                state.set("call_route_status", "pending_pc")
-                state.set("call_route_reason", "Preparing laptop call audio...")
-                state.set("call_route_backend", "none")
+                state.set_many(
+                    {
+                        "call_route_status": "pending_pc",
+                        "call_route_reason": "Preparing laptop call audio...",
+                        "call_route_backend": "none",
+                    }
+                )
             self._publish_state("talking", "pending_pc")
             if self.current_state == "talking" and not self._route_busy:
                 QTimer.singleShot(120, self.set_route_laptop)
@@ -191,9 +316,13 @@ class CallPopupSessionMixin:
                 return
             self._set_laptop_pending()
             if route_status != "pending_pc":
-                state.set("call_route_status", "pending_pc")
-                state.set("call_route_reason", "Preparing laptop call audio...")
-                state.set("call_route_backend", "none")
+                state.set_many(
+                    {
+                        "call_route_status": "pending_pc",
+                        "call_route_reason": "Preparing laptop call audio...",
+                        "call_route_backend": "none",
+                    }
+                )
             if self.current_state == "talking" and not self._route_busy:
                 QTimer.singleShot(220, self.set_route_laptop)
             return
@@ -252,8 +381,7 @@ class CallPopupSessionMixin:
 
         self._publish_state("missed_call", "phone")
         self._show_popup()
-        state.set("call_origin", "unknown")
-        state.set("call_muted", False)
+        state.set_many({"call_origin": "unknown", "call_muted": False})
         self._sync_popup_size()
 
     def _enter_ended(self):
@@ -270,8 +398,7 @@ class CallPopupSessionMixin:
         self._set_close_gate(True)
         self._set_route_panel_visible(False)
         self._set_extra_buttons(show_reply=False)
-        state.set("call_origin", "unknown")
-        state.set("call_muted", False)
+        state.set_many({"call_origin": "unknown", "call_muted": False})
         self._publish_state("ended", "phone")
         self._close_popup_now()
 
@@ -288,8 +415,7 @@ class CallPopupSessionMixin:
         self._set_close_gate(True)
         self._set_route_panel_visible(False)
         self._set_extra_buttons(show_reply=False)
-        state.set("call_origin", "unknown")
-        state.set("call_muted", False)
+        state.set_many({"call_origin": "unknown", "call_muted": False})
         self._publish_state("ended", "phone")
         self._close_popup_now()
 
@@ -302,60 +428,65 @@ class CallPopupSessionMixin:
         self.hide_popup()
 
     def answer_call(self):
-        self.primary_btn.setEnabled(False)
-        self.secondary_btn.setEnabled(False)
-        state.set("call_local_end_action", "")
-        state.set("call_origin", "popup_answer_laptop")
-        ADBBridge().answer_call()
-        self._enter_talking(reset_timer=True)
-        self.primary_btn.setEnabled(True)
-        self.secondary_btn.setEnabled(True)
+        state.set_many(
+            {
+                "call_local_end_action": "",
+                "call_origin": "popup_answer_laptop",
+            }
+        )
+        def _job():
+            return self._call_action_payload(call_controls.answer_call())
+        self._start_popup_action(
+            "answer",
+            _job,
+        )
 
     def reject_call(self):
         state.set("call_local_end_action", "reject")
-        ADBBridge().end_call()
-        self.dismiss_active_call()
+        def _job():
+            return self._call_action_payload(call_controls.end_call())
+        self._start_popup_action(
+            "reject",
+            _job,
+        )
 
     def end_call(self):
         state.set("call_local_end_action", "end")
-        ADBBridge().end_call()
-        self.dismiss_active_call()
+        def _job():
+            return self._call_action_payload(call_controls.end_call())
+        self._start_popup_action(
+            "end",
+            _job,
+        )
 
     def toggle_mute(self):
         desired = not bool(state.get("call_muted", False))
-        result = call_controls.set_call_muted(desired)
-        self.secondary_btn.setChecked(bool(state.get("call_muted", False)))
-        self.secondary_btn.setStyleSheet(self._button_style("mute", active=bool(state.get("call_muted", False))))
-        try:
-            from backend.ui_feedback import push_toast
-
-            if result.ok:
-                push_toast("Muted" if desired else "Unmuted", "info", 1300)
-            else:
-                push_toast(
-                    "Mute failed on laptop route" if result.route == "laptop" else "Mute command unsupported on this Android build",
-                    "warning",
-                    1800,
-                )
-        except Exception:
-            log.debug("Failed pushing mute toast", exc_info=True)
+        def _job():
+            result = call_controls.set_call_muted(desired)
+            payload = self._call_action_payload(result)
+            payload["ok"] = bool(result.ok)
+            payload["desired"] = desired
+            return payload
+        self._start_popup_action(
+            "mute",
+            _job,
+        )
 
     def call_back(self):
         number = (self.current_number or "").strip()
         if number:
-            state.set("call_local_end_action", "")
-            state.set("call_origin", "unknown")
-            ADBBridge()._run(
-                "shell",
-                "am",
-                "start",
-                "-a",
-                "android.intent.action.CALL",
-                "-d",
-                f"tel:{number}",
+            state.set_many(
+                {
+                    "call_local_end_action": "",
+                    "call_origin": "unknown",
+                }
             )
-        self._is_outbound_call = True
-        self._enter_ringing()
+        def _job():
+            return self._call_action_payload(call_controls.place_call(number))
+        self._start_popup_action(
+            "call_back",
+            _job,
+        )
 
     def dismiss_missed(self):
         self._publish_state("ended", "phone")
@@ -363,22 +494,14 @@ class CallPopupSessionMixin:
 
     def sms_reply_diversion_flow(self):
         self._call_timer.stop()
-        if self.current_state == "talking":
-            ADBBridge().end_call()
-        self._teardown_route()
-        state.set("sms_draft_number", self.current_number or "")
-        self._publish_state("ended", "phone")
-
-        if self.parent_window and hasattr(self.parent_window, "go_to"):
-            self.parent_window.go_to("messages")
-
-        try:
-            from backend.ui_feedback import push_toast
-
-            push_toast("Opening SMS composer…", "info", 1500)
-        except Exception:
-            log.debug("Failed pushing SMS diversion toast", exc_info=True)
-        self.hide_popup()
+        def _job():
+            if self.current_state != "talking":
+                return {"ok": True, "reason": ""}
+            return self._call_action_payload(call_controls.end_call())
+        self._start_popup_action(
+            "sms_reply",
+            _job,
+        )
 
     def _teardown_route(self, *, suspend_ui_global: bool = False):
         self._route_busy = False
@@ -467,9 +590,13 @@ class CallPopupSessionMixin:
         self._route_worker.finished.connect(lambda w=self._route_worker, t=token: self._on_bt_worker_finished(w, t))
         self._route_worker.start()
 
-        state.set("call_route_status", "pending_pc")
-        state.set("call_route_reason", "Preparing laptop call audio...")
-        state.set("call_route_backend", "none")
+        state.set_many(
+            {
+                "call_route_status": "pending_pc",
+                "call_route_reason": "Preparing laptop call audio...",
+                "call_route_backend": "none",
+            }
+        )
         self._publish_state(self.current_state if self.current_state in {"ringing", "talking"} else "ringing", "pending_pc")
 
     def _set_phone_selected(self, *, reset_failure: bool):
@@ -499,9 +626,13 @@ class CallPopupSessionMixin:
         self.laptop_option.set_mode(selected=True, subtext="ready")
         self._animate_bt_panel(False)
         self._publish_state(self.current_state if self.current_state in {"ringing", "talking"} else "talking", "pc")
-        state.set("call_route_status", "pc_active")
-        state.set("call_route_reason", "Audio on laptop/PC")
-        state.set("call_route_backend", "external_bt")
+        state.set_many(
+            {
+                "call_route_status": "pc_active",
+                "call_route_reason": "Audio on laptop/PC",
+                "call_route_backend": "external_bt",
+            }
+        )
         try:
             from backend.ui_feedback import push_toast
 
@@ -529,9 +660,13 @@ class CallPopupSessionMixin:
         self.laptop_option.set_mode(selected=False, failed=True, subtext=sub_reason)
         self._animate_bt_panel(False)
         self._publish_state(self.current_state if self.current_state in {"ringing", "talking"} else "ringing", "phone")
-        state.set("call_route_status", "pc_failed")
-        state.set("call_route_reason", reason)
-        state.set("call_route_backend", "none")
+        state.set_many(
+            {
+                "call_route_status": "pc_failed",
+                "call_route_reason": reason,
+                "call_route_backend": "none",
+            }
+        )
         try:
             from backend.ui_feedback import push_toast
 
@@ -566,9 +701,13 @@ class CallPopupSessionMixin:
         self.phone_option.set_mode(selected=True)
         self.laptop_option.set_mode(selected=False, failed=True, subtext="Timed out")
         self._animate_bt_panel(False)
-        state.set("call_route_status", "pc_failed")
-        state.set("call_route_reason", "Laptop audio route timed out")
-        state.set("call_route_backend", "none")
+        state.set_many(
+            {
+                "call_route_status": "pc_failed",
+                "call_route_reason": "Laptop audio route timed out",
+                "call_route_backend": "none",
+            }
+        )
         self._publish_state(self.current_state if self.current_state in {"ringing", "talking"} else "ended", "phone")
         try:
             from backend.ui_feedback import push_toast
@@ -585,18 +724,14 @@ class CallPopupSessionMixin:
         self._route_watchdog.stop()
         worker = self._route_worker
         if worker is not None:
+            self._invalidate_route_callbacks()
             try:
                 if worker.isRunning():
                     worker.requestInterruption()
+                    audio_route.set_source("call_pc_active", False)
                     worker.wait(800)
             except Exception:
                 log.debug("Failed waiting for BT route worker interruption", exc_info=True)
-            try:
-                if worker.isRunning():
-                    worker.terminate()
-                    worker.wait(300)
-            except Exception:
-                log.debug("Failed terminating BT route worker", exc_info=True)
             self._route_worker = None
         self._allow_close = True
         super().closeEvent(event)

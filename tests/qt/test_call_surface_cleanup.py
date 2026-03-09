@@ -7,8 +7,6 @@ import sys
 
 import pytest
 
-from backend.state import state
-
 pytestmark = pytest.mark.qt_runtime
 
 
@@ -32,6 +30,10 @@ def _collect_texts(widget):
         cls = getattr(qtwidgets, cls_name)
         texts.extend(str(child.text()) for child in widget.findChildren(cls))
     return texts
+
+
+def _state():
+    return importlib.import_module("backend.state").state
 
 
 def test_window_page_registry_drops_sync_page(app):
@@ -152,7 +154,7 @@ def test_call_popup_route_summary_and_mute_visibility_follow_call_route_ui_state
         "mute_active": False,
         "updated_at": 1,
     }
-    state.set("call_route_ui_state", phone_route)
+    _state().set("call_route_ui_state", phone_route)
     popup._on_call_route_ui_state_changed(phone_route)
     assert popup.route_summary_label.text() == "Speaker: Phone · Mic: Phone"
     assert popup.secondary_btn.isHidden() is True
@@ -166,8 +168,8 @@ def test_call_popup_route_summary_and_mute_visibility_follow_call_route_ui_state
         "mute_active": True,
         "updated_at": 2,
     }
-    state.set("call_muted", True)
-    state.set("call_route_ui_state", laptop_route)
+    _state().set("call_muted", True)
+    _state().set("call_route_ui_state", laptop_route)
     popup._on_call_route_ui_state_changed(laptop_route)
     popup._on_call_muted_changed(True)
 
@@ -246,7 +248,7 @@ def test_calls_page_places_call_without_sync_adb_block(monkeypatch, app):
     page._place_call()
 
     assert launched == ["+15551234567"]
-    call_ui = state.get("call_ui_state", {}) or {}
+    call_ui = _state().get("call_ui_state", {}) or {}
     assert call_ui.get("phase") == "dialing"
     assert call_ui.get("number") == "+15551234567"
 
@@ -324,7 +326,7 @@ def test_calls_page_terminal_cleanup_clears_mute_async(monkeypatch, app):
     page = calls.CallsPage()
     cleared: list[str] = []
     monkeypatch.setattr(page, "_clear_call_mute_async", lambda: cleared.append("clear"))
-    state.set("call_muted", True)
+    _state().set("call_muted", True)
 
     page._on_call_ui_state_changed({"phase": "ended", "status": "ended"})
 
